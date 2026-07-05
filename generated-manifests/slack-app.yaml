@@ -1,0 +1,31 @@
+display_information:
+  name: LightGrant
+  description: Temporary GitHub access from Slack
+  background_color: "#1f2937"
+
+features:
+  bot_user:
+    display_name: LightGrant
+    always_online: false
+
+  slash_commands:
+    - command: /lightgrant
+      url: https://test.lightgrant.app/slack/events
+      description: Request temporary GitHub team access
+      usage_hint: request | link | policy | audit | status | help
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - commands
+      - chat:write
+
+settings:
+  interactivity:
+    is_enabled: true
+    request_url: https://test.lightgrant.app/slack/events
+
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
