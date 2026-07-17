@@ -455,17 +455,35 @@ export class JobWorker {
               )
             : 60;
 
+        // A reactivated grant may wrap a membership the app never created.
+        // Re-derive the origin instead of assuming app-created, or the next
+        // expiry would remove a permanent member from the team.
+        const origin = determineMembershipOrigin({
+          mutationState: grant.membership_mutation_state,
+          membershipCreatedByApp: grant.membership_created_by_app === 1,
+          observedRole: "member",
+        });
+
         this.db.transaction(() => {
           this.grantRepo.updateMutationState(grantId, {
             membershipMutationState: "membership_confirmed",
             membershipAddLastVerifiedAt: timestamp,
           });
-          this.grantRepo.updateGrantStatusAndMembership(
-            grantId,
-            "active",
-            1,
-            null,
-          );
+          if (origin === "preexisting") {
+            this.grantRepo.updateGrantStatusAndMembership(
+              grantId,
+              "already_present",
+              0,
+              "member",
+            );
+          } else {
+            this.grantRepo.updateGrantStatusAndMembership(
+              grantId,
+              "active",
+              1,
+              null,
+            );
+          }
           this.jobRepo.completeJob(job.id);
 
           auditRepo.writeEventTx({
@@ -478,6 +496,7 @@ export class JobWorker {
             payloadJson: JSON.stringify({
               reason: "membership_already_member_during_reactivate",
               role: "member",
+              origin,
             }),
           });
 

@@ -373,6 +373,14 @@ export class GrantRepository {
 
   /**
    * Update grant status and preexisting membership info.
+   *
+   * membership_created_by_app is deliberately monotonic: once a grant is known
+   * to wrap a membership LightGrant did not create (0), no later write may
+   * promote it to app-created (1). Callers re-derive this flag from live GitHub
+   * state on paths such as reactivation, where a stale or absent observation
+   * would otherwise mark a permanent member as app-created and expose them to
+   * automatic removal. Downgrading 1 -> 0 stays allowed: that direction only
+   * ever widens protection. preexisting_role is preserved for the same reason.
    */
   updateGrantStatusAndMembership(
     grantId: string,
@@ -386,14 +394,28 @@ export class GrantRepository {
         `
       UPDATE grants
       SET status = ?,
-          membership_created_by_app = ?,
-          preexisting_role = ?,
+          membership_created_by_app = CASE
+            WHEN membership_created_by_app = 0 THEN 0
+            ELSE ?
+          END,
+          preexisting_role = CASE
+            WHEN membership_created_by_app = 0 THEN COALESCE(?, preexisting_role)
+            ELSE ?
+          END,
           granted_at = COALESCE(granted_at, ?),
           updated_at = ?
       WHERE id = ?
     `,
       )
-      .run(status, membershipCreatedByApp, preexistingRole, now, now, grantId);
+      .run(
+        status,
+        membershipCreatedByApp,
+        preexistingRole,
+        preexistingRole,
+        now,
+        now,
+        grantId,
+      );
   }
 
   /**
