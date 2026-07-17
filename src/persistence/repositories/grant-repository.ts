@@ -29,6 +29,13 @@ export interface DbGrant {
   last_revoke_alert_reason: string | null;
   /** When this grant entered 'revoking'; the lease held by that revocation. */
   revoking_started_at: string | null;
+  /**
+   * Unique fencing token for the revocation run that currently owns this
+   * grant. Only the holder of this id may perform the destructive GitHub call
+   * and the terminal DB write; a worker whose id no longer matches has lost
+   * the lease and must abort.
+   */
+  revoking_lease_id: string | null;
 }
 
 export interface CreateGrantInput {
@@ -244,6 +251,157 @@ export class GrantRepository {
         now,
         id,
       );
+  }
+
+  /**
+   * Take the revoke lease for a grant, stamping a fresh fencing token.
+   *
+   * A grant is leasable when it is in a revocable state, or already in
+   * 'revoking' but with a stale/absent lease (its previous owner died). The
+   * update is a Compare-and-Set: it succeeds for exactly one racing worker and
+   * hands that worker a unique `leaseId` that fences every later step of its
+   * run. A revocation still in flight (fresh lease) is left untouched.
+   *
+   * @param staleRevokingBefore ISO instant; a 'revoking' lease taken at or
+   * before this counts as abandoned and may be reclaimed.
+   * @returns true when this caller took the lease.
+   */
+  acquireRevokeLease(
+    id: string,
+    leaseId: string,
+    nowStr: string,
+    staleRevokingBefore: string,
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'revoking',
+          revoking_started_at = ?,
+          revoking_lease_id = ?,
+          updated_at = ?
+      WHERE id = ?
+        AND (
+          status IN ('active', 'revoke_failed', 'already_present')
+          OR (
+            status = 'revoking'
+            AND (revoking_started_at IS NULL OR revoking_started_at <= ?)
+          )
+        )
+    `,
+      )
+      .run(nowStr, leaseId, nowStr, id, staleRevokingBefore);
+    return result.changes === 1;
+  }
+
+  /**
+   * Whether this run still owns the revoke lease for a grant.
+   *
+   * Ownership means the grant is still 'revoking', still carries this run's
+   * fencing token, and the lease has not gone stale. Callers check this
+   * immediately before an irreversible GitHub mutation so a worker that lost
+   * its lease never removes a member the current owner may have already
+   * reinstated.
+   */
+  ownsRevokeLease(
+    id: string,
+    leaseId: string,
+    staleRevokingBefore: string,
+  ): boolean {
+    const row = this.db
+      .prepare(
+        `
+      SELECT 1 AS present FROM grants
+      WHERE id = ?
+        AND status = 'revoking'
+        AND revoking_lease_id = ?
+        AND revoking_started_at IS NOT NULL
+        AND revoking_started_at > ?
+    `,
+      )
+      .get(id, leaseId, staleRevokingBefore);
+    return !!row;
+  }
+
+  /**
+   * Write a terminal revocation outcome, but only if this run still holds the
+   * lease. The fencing predicate (status = 'revoking', matching lease id, lease
+   * not stale) makes the write a no-op for a worker whose lease was reclaimed,
+   * so it can never overwrite the new owner's result or a later reactivation.
+   * On success the lease is released (both lease columns cleared) since the
+   * grant is leaving 'revoking'.
+   *
+   * @returns true when the fenced write landed; false means the lease was lost
+   * and the caller must stop without side effects.
+   */
+  finalizeRevocationWithLease(
+    id: string,
+    leaseId: string,
+    staleRevokingBefore: string,
+    params: {
+      status: string;
+      revokedAt: string | null;
+      attemptCount: number;
+      nextAttemptAt: string | null;
+      errorCode: string | null;
+      errorMessage: string | null;
+    },
+  ): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET
+        status = ?,
+        revoked_at = ?,
+        revoke_attempt_count = ?,
+        next_revoke_attempt_at = ?,
+        last_error_code = ?,
+        last_error_message = ?,
+        revoking_started_at = NULL,
+        revoking_lease_id = NULL,
+        updated_at = ?
+      WHERE id = ?
+        AND status = 'revoking'
+        AND revoking_lease_id = ?
+        AND revoking_started_at IS NOT NULL
+        AND revoking_started_at > ?
+    `,
+      )
+      .run(
+        params.status,
+        params.revokedAt,
+        params.attemptCount,
+        params.nextAttemptAt,
+        params.errorCode,
+        params.errorMessage,
+        now,
+        id,
+        leaseId,
+        staleRevokingBefore,
+      );
+    return result.changes === 1;
+  }
+
+  /**
+   * Release the revoke lease without changing status. Used when a revocation is
+   * cancelled in place (a new active request arrives) so a returning zombie
+   * cannot match the token that governed the abandoned run.
+   */
+  clearRevokeLease(id: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET revoking_started_at = NULL,
+          revoking_lease_id = NULL,
+          updated_at = ?
+      WHERE id = ?
+    `,
+      )
+      .run(now, id);
   }
 
   /**
@@ -482,6 +640,12 @@ export class GrantRepository {
   /**
    * Reactivate an existing grant by setting to pending and reactivation_required,
    * clearing revoke attempt count and scheduling.
+   *
+   * Reactivation also releases any revoke lease (revoking_started_at /
+   * revoking_lease_id). A grant may be reactivated while a stale revocation is
+   * still in flight; clearing the lease explicitly expires that run, so a
+   * worker returning from the abandoned revoke can no longer match the token
+   * and remove the member this reactivation just kept.
    */
   reactivateGrant(
     grantId: string,
@@ -499,6 +663,8 @@ export class GrantRepository {
           next_revoke_attempt_at = NULL,
           revoke_attempt_count = 0,
           revoked_at = NULL,
+          revoking_started_at = NULL,
+          revoking_lease_id = NULL,
           updated_at = ?
       WHERE id = ?
     `,

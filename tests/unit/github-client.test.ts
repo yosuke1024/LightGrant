@@ -1,5 +1,10 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { GitHubClient } from "../../src/integrations/github/github-client.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  GitHubClient,
+  GITHUB_REQUEST_TIMEOUT_MS,
+  withRequestTimeout,
+} from "../../src/integrations/github/github-client.js";
+import { REVOKE_LEASE_SECONDS } from "../../src/services/revocation-service.js";
 import {
   GitHubRateLimitError,
   GitHubIdpSyncError,
@@ -205,6 +210,113 @@ describe("GitHubClient", () => {
     expect(membership.role).toBe("member");
     expect(mockRequest).toHaveBeenCalledWith("GET /user/{account_id}", {
       account_id: 999,
+    });
+  });
+
+  describe("revoke-path request timeout", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("bounds the timeout well below the revoke lease", () => {
+      expect(GITHUB_REQUEST_TIMEOUT_MS).toBeLessThan(
+        REVOKE_LEASE_SECONDS * 1000,
+      );
+    });
+
+    it("aborts the underlying request via the propagated signal", async () => {
+      vi.useFakeTimers();
+      let received: AbortSignal | undefined;
+      const p = withRequestTimeout(
+        (signal) =>
+          new Promise<void>((_resolve, reject) => {
+            received = signal;
+            signal.addEventListener("abort", () =>
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            );
+          }),
+        1000,
+      );
+      // Attach the rejection handler before advancing so the rejection is never
+      // momentarily unhandled.
+      const assertion = expect(p).rejects.toThrow("aborted");
+
+      await vi.advanceTimersByTimeAsync(1001);
+
+      expect(received?.aborted).toBe(true);
+      await assertion;
+    });
+
+    it("maps a getTeamMembership timeout to a retryable transient error", async () => {
+      vi.useFakeTimers();
+      // installation resolution, then login lookup, then a membership read that
+      // hangs until its abort signal fires.
+      mockRequest
+        .mockResolvedValueOnce({
+          data: {
+            id: 98765,
+            target_id: 1111,
+            target_type: "Organization",
+            account: { login: "test-org" },
+          },
+        })
+        .mockResolvedValueOnce({ data: { id: 999, login: "test-user" } })
+        .mockImplementationOnce(
+          (_route: string, opts: { request?: { signal?: AbortSignal } }) =>
+            new Promise((_resolve, reject) => {
+              const signal = opts.request?.signal;
+              signal?.addEventListener("abort", () =>
+                reject(
+                  Object.assign(new Error("The operation was aborted"), {
+                    name: "AbortError",
+                  }),
+                ),
+              );
+            }),
+        );
+
+      const pending = client.getTeamMembership(1, 999);
+      const assertion = expect(pending).rejects.toBeInstanceOf(
+        GitHubTransientError,
+      );
+      await vi.advanceTimersByTimeAsync(GITHUB_REQUEST_TIMEOUT_MS + 10);
+
+      await assertion;
+    });
+
+    it("maps a removeTeamMember timeout to a retryable transient error", async () => {
+      vi.useFakeTimers();
+      mockRequest
+        .mockResolvedValueOnce({
+          data: {
+            id: 98765,
+            target_id: 1111,
+            target_type: "Organization",
+            account: { login: "test-org" },
+          },
+        })
+        .mockResolvedValueOnce({ data: { id: 999, login: "test-user" } })
+        .mockImplementationOnce(
+          (_route: string, opts: { request?: { signal?: AbortSignal } }) =>
+            new Promise((_resolve, reject) => {
+              const signal = opts.request?.signal;
+              signal?.addEventListener("abort", () =>
+                reject(
+                  Object.assign(new Error("The operation was aborted"), {
+                    name: "AbortError",
+                  }),
+                ),
+              );
+            }),
+        );
+
+      const pending = client.removeTeamMember(1, 999);
+      const assertion = expect(pending).rejects.toBeInstanceOf(
+        GitHubTransientError,
+      );
+      await vi.advanceTimersByTimeAsync(GITHUB_REQUEST_TIMEOUT_MS + 10);
+
+      await assertion;
     });
   });
 });

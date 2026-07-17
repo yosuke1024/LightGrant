@@ -207,18 +207,29 @@ describe("stranded revoking grants", () => {
         createdAt: timestamp,
         updatedAt: timestamp,
       });
-      // Fail the removal so the grant stays mid-revocation and we can observe
-      // the lease that was stamped on the way in.
-      mockGithubClient.getTeamMembership.mockResolvedValue({ role: "member" });
-      mockGithubClient.removeTeamMember.mockRejectedValue(new Error("boom"));
+      // Park the pre-removal membership check so the grant sits in 'revoking'
+      // and we can observe the lease stamped on the way in. (Once the run
+      // finishes it leaves 'revoking' and the lease is released.)
+      let releaseCheck!: (value: { role: string }) => void;
+      const parkedCheck = new Promise<{ role: string }>((resolve) => {
+        releaseCheck = resolve;
+      });
+      mockGithubClient.getTeamMembership
+        .mockReturnValueOnce(parkedCheck)
+        .mockResolvedValueOnce(null);
 
-      await buildService().revoke(grantRepo.getGrant("grant-lease")!);
+      const pending = buildService().revoke(grantRepo.getGrant("grant-lease")!);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
 
+      const parked = grantRepo.getGrant("grant-lease")!;
+      expect(parked.status).toBe("revoking");
       // Assert on the value, not merely "not null": an absent column reads as
       // undefined and would sail past a not-null check.
-      expect(grantRepo.getGrant("grant-lease")?.revoking_started_at).toEqual(
-        expect.any(String),
-      );
+      expect(parked.revoking_started_at).toEqual(expect.any(String));
+      expect(parked.revoking_lease_id).toEqual(expect.any(String));
+
+      releaseCheck({ role: "member" });
+      await pending;
     });
   });
 
