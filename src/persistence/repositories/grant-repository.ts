@@ -419,6 +419,51 @@ export class GrantRepository {
   }
 
   /**
+   * Take ownership of a membership this app just created and verified.
+   *
+   * This is the only sanctioned way to promote membership_created_by_app from
+   * 0 to 1, which updateGrantStatusAndMembership deliberately forbids. A grant
+   * that previously wrapped a preexisting membership can legitimately come to
+   * wrap an app-created one: the user leaves the team, a later request finds
+   * the membership absent, and LightGrant adds them back. That new membership
+   * is ours to revoke, and the stale preexisting_role must not outlive it.
+   *
+   * Promotion is gated on membership_mutation_state = 'add_request_sent' so it
+   * can only follow an add this app actually issued in the same run. Callers
+   * must therefore have observed absence, called addTeamMember successfully,
+   * and re-verified the membership live. It must NOT be used where membership
+   * was merely observed — reactivation re-checks, membership_confirmed
+   * revalidation, or recovery after an add whose outcome is unknown — since
+   * there the membership may be the user's own permanent one.
+   *
+   * @returns true when the grant was promoted; false when the CAS did not
+   * match, leaving the caller to fall back to a non-promoting update.
+   */
+  confirmMembershipCreatedByAppAfterVerifiedAdd(
+    grantId: string,
+    verifiedAt: string,
+  ): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'active',
+          membership_created_by_app = 1,
+          preexisting_role = NULL,
+          membership_mutation_state = 'membership_confirmed',
+          membership_add_last_verified_at = ?,
+          granted_at = COALESCE(granted_at, ?),
+          updated_at = ?
+      WHERE id = ?
+        AND membership_mutation_state = 'add_request_sent'
+    `,
+      )
+      .run(verifiedAt, now, now, grantId);
+    return result.changes === 1;
+  }
+
+  /**
    * Reactivate an existing grant by setting to pending and reactivation_required,
    * clearing revoke attempt count and scheduling.
    */

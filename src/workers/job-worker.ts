@@ -339,6 +339,36 @@ export class JobWorker {
     this.jobRepo.completeJob(job.id);
   }
 
+  /**
+   * Record a membership this app added and then verified live, claiming
+   * ownership so it will be revoked at expiry.
+   *
+   * Only call this once addTeamMember has returned successfully and a live
+   * re-check has confirmed the membership; the repository CAS on
+   * 'add_request_sent' enforces that. Must run inside a transaction.
+   */
+  private claimVerifiedAddedMembership(grantId: string): void {
+    const verifiedAt = new Date().toISOString();
+    const claimed = this.grantRepo.confirmMembershipCreatedByAppAfterVerifiedAdd(
+      grantId,
+      verifiedAt,
+    );
+    if (claimed) return;
+
+    // The grant left 'add_request_sent' under us, so we cannot attribute the
+    // membership to this add. Record the confirmation but leave ownership as
+    // it stands: a preexisting membership keeps its protection.
+    logger.warn(
+      { grantId },
+      "Grant left add_request_sent before verification; recording confirmation without claiming ownership",
+    );
+    this.grantRepo.updateMutationState(grantId, {
+      membershipMutationState: "membership_confirmed",
+      membershipAddLastVerifiedAt: verifiedAt,
+    });
+    this.grantRepo.updateGrantStatusAndMembership(grantId, "active", 1, null);
+  }
+
   private async handleGrantAccess(job: DbJob, grantId: string): Promise<void> {
     const grant = this.grantRepo.getGrant(grantId);
     if (!grant) {
@@ -1244,16 +1274,9 @@ export class JobWorker {
 
       if (confirmedRole === "maintainer") {
         this.db.transaction(() => {
-          this.grantRepo.updateMutationState(grantId, {
-            membershipMutationState: "membership_confirmed",
-            membershipAddLastVerifiedAt: new Date().toISOString(),
-          });
-          this.grantRepo.updateGrantStatusAndMembership(
-            grantId,
-            "active",
-            1,
-            null,
-          );
+          // This app issued the add and verified it live, so the membership is
+          // ours regardless of what the grant wrapped before.
+          this.claimVerifiedAddedMembership(grantId);
           this.grantRepo.updateGrantStatus(
             grantId,
             "active",
@@ -1280,16 +1303,7 @@ export class JobWorker {
         })();
       } else {
         this.db.transaction(() => {
-          this.grantRepo.updateMutationState(grantId, {
-            membershipMutationState: "membership_confirmed",
-            membershipAddLastVerifiedAt: new Date().toISOString(),
-          });
-          this.grantRepo.updateGrantStatusAndMembership(
-            grantId,
-            "active",
-            1,
-            null,
-          );
+          this.claimVerifiedAddedMembership(grantId);
           this.jobRepo.completeJob(job.id);
 
           auditRepo.writeEventTx({
