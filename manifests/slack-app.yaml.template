@@ -16,7 +16,13 @@ features:
       should_escape: false
 
 oauth_config:
+  # "Sign in with Slack" (OpenID Connect) callback. Used to bind the browser
+  # completing GitHub OAuth to the Slack user that started the request.
+  redirect_urls:
+    - __PUBLIC_BASE_URL__/auth/slack/callback
   scopes:
+    user:
+      - openid
     bot:
       - commands
       - chat:write

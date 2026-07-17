@@ -10,6 +10,9 @@ export interface DbOAuthState {
   expires_at: string;
   used_at: string | null;
   created_at: string;
+  oidc_nonce_hash: string | null;
+  slack_verified_at: string | null;
+  binding_token_hash: string | null;
 }
 
 export class OAuthStateRepository {
@@ -77,14 +80,54 @@ export class OAuthStateRepository {
   }
 
   /**
-   * Mark the OAuth state session as used/consumed.
+   * Record the OIDC nonce hash for the pending "Sign in with Slack" leg.
+   * Called at /auth/github/start before redirecting the browser to Slack.
+   */
+  setOidcNonceHash(id: string, oidcNonceHash: string): void {
+    this.db
+      .prepare(
+        `
+      UPDATE oauth_states
+      SET oidc_nonce_hash = ?
+      WHERE id = ?
+    `,
+      )
+      .run(oidcNonceHash, id);
+  }
+
+  /**
+   * Mark this flow as Slack-verified and store the one-time browser-binding
+   * token hash. Only rows that are still unverified and unused are updated, so
+   * the OIDC leg is idempotent and cannot be re-driven onto a consumed state.
+   * Returns true when a row was actually transitioned.
+   */
+  markSlackVerified(
+    id: string,
+    verifiedAt: string,
+    bindingTokenHash: string,
+  ): boolean {
+    const info = this.db
+      .prepare(
+        `
+      UPDATE oauth_states
+      SET slack_verified_at = ?, binding_token_hash = ?
+      WHERE id = ? AND used_at IS NULL AND slack_verified_at IS NULL
+    `,
+      )
+      .run(verifiedAt, bindingTokenHash, id);
+    return info.changes > 0;
+  }
+
+  /**
+   * Mark the OAuth state session as used/consumed. Also clears the binding
+   * token hash: once consumed the one-time cookie must never link again.
    */
   markAsUsed(id: string, timestamp: string): void {
     this.db
       .prepare(
         `
       UPDATE oauth_states
-      SET used_at = ?
+      SET used_at = ?, binding_token_hash = NULL
       WHERE id = ?
     `,
       )

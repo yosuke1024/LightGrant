@@ -11,6 +11,7 @@ Through Slack commands, users can request temporary access to specific GitHub te
 ## 🚀 Key Features
 1. **GitHub to Slack Identity Linkage (OAuth Flow)**
    - Sends a secure sign-in link via DM to users upon their first request to link Slack and GitHub identities (utilizing single-use nonces and signed state tokens to protect against replay attacks).
+   - Before GitHub authorization, the browser must complete **"Sign in with Slack" (OpenID Connect)** and be confirmed as the same Slack user that started the request. A one-time, `HttpOnly` browser-binding cookie then ties that verified browser to the GitHub callback, so a connect link forwarded to another person cannot bind their GitHub account to the initiator's Slack user.
 2. **Slack-Driven JIT Access Requests (`/lightgrant`)**
    - Triggers an interactive modal allowing users to select target GitHub teams, request durations (e.g., 30 mins to 24 hours), and document justification.
 3. **Auto-Approval Policy & Rule Engine**
@@ -69,6 +70,7 @@ This generates:
 2. Copy and paste the contents of `generated-manifests/slack-app.yaml`.
 3. Install the app to your workspace.
 4. Retrieve the **Bot User OAuth Token** (`xoxb-...`) and **Signing Secret**.
+5. Under **Basic Information → App Credentials**, retrieve the **Client ID** and **Client Secret**. These power "Sign in with Slack" (OpenID Connect) and are required (`SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET`). The manifest already registers the `openid` user scope and the `/auth/slack/callback` redirect URL; if you created the app before this feature, add both manually and reinstall.
 
 #### Step 4: Create and Install GitHub App
 1. Go to your GitHub Organization settings -> **Developer settings** -> **GitHub Apps** -> **New GitHub App**.
@@ -126,6 +128,8 @@ DATABASE_PATH=/data/lightgrant.sqlite
 # Slack Configurations
 SLACK_SIGNING_SECRET=your-slack-signing-secret
 SLACK_BOT_TOKEN=xoxb-your-slack-bot-token
+SLACK_CLIENT_ID=your-slack-client-id          # Basic Information → App Credentials (Sign in with Slack / OIDC)
+SLACK_CLIENT_SECRET=your-slack-client-secret  # Basic Information → App Credentials (Sign in with Slack / OIDC)
 SLACK_APPROVAL_CHANNEL_ID=C12345678      # Channel to post manual approval request cards
 SLACK_AUDIT_CHANNEL_ID=C87654321         # Channel to post audit logs
 

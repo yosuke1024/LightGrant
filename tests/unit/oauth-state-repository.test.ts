@@ -60,4 +60,74 @@ describe("OAuthStateRepository", () => {
     const stateAfter = repository.getState("state-1");
     expect(stateAfter?.used_at).toBe(timestamp);
   });
+
+  it("should record the OIDC nonce hash for the Slack leg", () => {
+    const ts = new Date().toISOString();
+    repository.createState(
+      "state-oidc",
+      "nonce-oidc",
+      "W1",
+      "U1",
+      null,
+      null,
+      new Date(Date.now() + 600000).toISOString(),
+      ts,
+    );
+
+    repository.setOidcNonceHash("state-oidc", "oidc-hash-abc");
+    expect(repository.getState("state-oidc")?.oidc_nonce_hash).toBe(
+      "oidc-hash-abc",
+    );
+  });
+
+  it("markSlackVerified stores the binding hash once and is idempotent", () => {
+    const ts = new Date().toISOString();
+    repository.createState(
+      "state-bind",
+      "nonce-bind",
+      "W1",
+      "U1",
+      null,
+      null,
+      new Date(Date.now() + 600000).toISOString(),
+      ts,
+    );
+
+    const first = repository.markSlackVerified("state-bind", ts, "bind-hash-1");
+    expect(first).toBe(true);
+    const row = repository.getState("state-bind");
+    expect(row?.slack_verified_at).toBe(ts);
+    expect(row?.binding_token_hash).toBe("bind-hash-1");
+
+    // A second attempt must not overwrite the binding for an already-verified flow.
+    const second = repository.markSlackVerified(
+      "state-bind",
+      ts,
+      "bind-hash-2",
+    );
+    expect(second).toBe(false);
+    expect(repository.getState("state-bind")?.binding_token_hash).toBe(
+      "bind-hash-1",
+    );
+  });
+
+  it("markAsUsed clears the binding token hash so the cookie cannot re-link", () => {
+    const ts = new Date().toISOString();
+    repository.createState(
+      "state-consume",
+      "nonce-consume",
+      "W1",
+      "U1",
+      null,
+      null,
+      new Date(Date.now() + 600000).toISOString(),
+      ts,
+    );
+    repository.markSlackVerified("state-consume", ts, "bind-hash");
+
+    repository.markAsUsed("state-consume", ts);
+    const row = repository.getState("state-consume");
+    expect(row?.used_at).toBe(ts);
+    expect(row?.binding_token_hash).toBeNull();
+  });
 });

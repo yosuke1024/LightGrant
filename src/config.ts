@@ -11,6 +11,8 @@ if (process.env.NODE_ENV !== "production") {
 const PLACEHOLDERS = [
   "your-slack-bot-token",
   "your-slack-signing-secret",
+  "your-slack-client-id",
+  "your-slack-client-secret",
   "C0000000000",
   "my-organization",
   "your-client-id",
@@ -52,6 +54,15 @@ const configSchema = z.object({
     message: "Must not contain placeholder values",
   }),
   SLACK_SIGNING_SECRET: z.string().min(1).refine(isNotPlaceholder, {
+    message: "Must not contain placeholder values",
+  }),
+  // Slack app credentials used for "Sign in with Slack" (OpenID Connect).
+  // Required so the GitHub OAuth flow can prove the browser completing the
+  // link belongs to the Slack user recorded in the signed state.
+  SLACK_CLIENT_ID: z.string().min(1).refine(isNotPlaceholder, {
+    message: "Must not contain placeholder values",
+  }),
+  SLACK_CLIENT_SECRET: z.string().min(1).refine(isNotPlaceholder, {
     message: "Must not contain placeholder values",
   }),
   SLACK_APPROVAL_CHANNEL_ID: z.string().min(1).refine(isNotPlaceholder, {
