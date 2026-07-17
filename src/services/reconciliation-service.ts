@@ -2,7 +2,10 @@ import Database from "better-sqlite3";
 import { GrantRepository } from "../persistence/repositories/grant-repository.js";
 import { AuditRepository } from "../persistence/repositories/audit-repository.js";
 import { TeamRepository } from "../persistence/repositories/team-repository.js";
-import { RevocationService } from "./revocation-service.js";
+import {
+  RevocationService,
+  staleRevokingBefore,
+} from "./revocation-service.js";
 import { GitHubAccessProvider } from "../integrations/github/github-client.js";
 import { logger } from "../logger.js";
 import { GitHubOrganizationContext } from "../domain/github-organization-context.js";
@@ -34,7 +37,10 @@ export class ReconciliationService {
 
     // 1. Process Expired Grants
     try {
-      const expiredGrants = this.grantRepo.getExpiredGrants(now);
+      const expiredGrants = this.grantRepo.getExpiredGrants(
+        now,
+        staleRevokingBefore(now),
+      );
       if (expiredGrants.length > 0) {
         logger.info(
           { count: expiredGrants.length },

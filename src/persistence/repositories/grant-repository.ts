@@ -27,6 +27,8 @@ export interface DbGrant {
   membership_add_last_verified_at: string | null;
   last_revoke_alert_at: string | null;
   last_revoke_alert_reason: string | null;
+  /** When this grant entered 'revoking'; the lease held by that revocation. */
+  revoking_started_at: string | null;
 }
 
 export interface CreateGrantInput {
@@ -151,22 +153,36 @@ export class GrantRepository {
 
   /**
    * Retrieve active or failing grants that have expired.
+   *
+   * Grants parked in 'revoking' are included once their revoke lease has gone
+   * stale. A revocation that dies partway through leaves the grant in that
+   * state, and without this sweep nothing would ever select it again: the
+   * grant would keep its access forever. A lease newer than
+   * staleRevokingBefore means a revocation is still in flight, so it is left
+   * alone. A missing lease records no live claim and is reclaimable.
+   *
+   * @param staleRevokingBefore ISO instant; 'revoking' grants leased at or
+   * before this are considered abandoned.
    */
-  getExpiredGrants(nowStr: string): DbGrant[] {
+  getExpiredGrants(nowStr: string, staleRevokingBefore: string): DbGrant[] {
     const rows = this.db
       .prepare(
         `
       SELECT * FROM grants
-      WHERE status IN ('active', 'revoke_failed', 'already_present')
+      WHERE status IN ('active', 'revoke_failed', 'already_present', 'revoking')
         AND effective_expires_at <= ?
         AND (
           status IN ('active', 'already_present')
-          OR next_revoke_attempt_at <= ?
+          OR (status = 'revoke_failed' AND next_revoke_attempt_at <= ?)
+          OR (
+            status = 'revoking'
+            AND (revoking_started_at IS NULL OR revoking_started_at <= ?)
+          )
         )
         AND revoked_at IS NULL
     `,
       )
-      .all(nowStr, nowStr);
+      .all(nowStr, nowStr, staleRevokingBefore);
     return (rows as DbGrant[]) || [];
   }
 

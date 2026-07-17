@@ -18,6 +18,23 @@ export function calculateRevokeRetryDelay(attempt: number): number {
   return 60 * 60; // 1h
 }
 
+/**
+ * How long a revocation may hold a grant in 'revoking' before another run may
+ * take it over.
+ *
+ * A revocation is a handful of GitHub calls and completes in seconds, so this
+ * is set far above any legitimate run: the window only has to be long enough
+ * that we never race a revocation that is merely slow. The cost of the margin
+ * is that access lingers this much past expiry when a process dies mid-revoke,
+ * which is the rarer and less harmful outcome.
+ */
+export const REVOKE_LEASE_SECONDS = 15 * 60;
+
+/** The instant at or before which a 'revoking' lease counts as abandoned. */
+export function staleRevokingBefore(nowStr: string): string {
+  return new Date(Date.parse(nowStr) - REVOKE_LEASE_SECONDS * 1000).toISOString();
+}
+
 export class RevocationService {
   constructor(
     private db: Database.Database,
@@ -49,23 +66,40 @@ export class RevocationService {
         return null;
       }
 
-      // 1.2. Compare-and-Set Status update to 'revoking'
+      // 1.2. Compare-and-Set Status update to 'revoking', taking the lease.
+      // A grant already in 'revoking' is only reclaimable once its lease has
+      // gone stale, so this still excludes a revocation that is in flight
+      // while rescuing one whose process died.
       const affected = this.db
         .prepare(
           `
         UPDATE grants
-        SET status = 'revoking', updated_at = ?
-        WHERE id = ? AND status IN ('active', 'revoke_failed', 'already_present')
+        SET status = 'revoking', revoking_started_at = ?, updated_at = ?
+        WHERE id = ?
+          AND (
+            status IN ('active', 'revoke_failed', 'already_present')
+            OR (
+              status = 'revoking'
+              AND (revoking_started_at IS NULL OR revoking_started_at <= ?)
+            )
+          )
       `,
         )
-        .run(now, grant.id).changes;
+        .run(now, now, grant.id, staleRevokingBefore(now)).changes;
 
       if (affected !== 1) {
         logger.warn(
           { grantId: grant.id },
-          "Grant status is not active/failed/already_present (potential concurrent revocation)",
+          "Grant is not revocable (already revoked, or a revocation is in flight)",
         );
         return null;
+      }
+
+      if (freshGrant.status === "revoking") {
+        logger.warn(
+          { grantId: grant.id, leaseStartedAt: freshGrant.revoking_started_at },
+          "Reclaiming grant abandoned mid-revocation",
+        );
       }
 
       return freshGrant;
