@@ -186,6 +186,45 @@ describe("revoke lease fencing", () => {
     expect(row.revoking_lease_id).not.toBe("old-lease-id");
   });
 
+  it("fences a worker whose own lease expired while it was stalled, with no reclaimer", async () => {
+    // Lease expiry must be judged against the CURRENT time, not a cutoff frozen
+    // at revoke() start. Otherwise a worker that stalls past the lease window
+    // still sees its own lease as live and resumes destructive work even though
+    // no other worker took over yet — the window in which a reclaimer is about
+    // to appear.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-01T00:00:00.000Z"));
+    seedActiveExpiredGrant("grant-self-expire");
+
+    // Park A at the pre-removal membership check.
+    const parkedA = deferred<{ role: string } | null>();
+    mockGithubClient.getTeamMembership.mockReturnValueOnce(parkedA.promise);
+
+    const workerA = buildService().revoke(
+      grantRepo.getGrant("grant-self-expire")!,
+    );
+    await flush();
+    expect(grantRepo.getGrant("grant-self-expire")!.status).toBe("revoking");
+
+    // 16 minutes pass while A is stalled — its lease is now stale. No other
+    // worker runs.
+    vi.setSystemTime(new Date("2026-03-01T00:16:00.000Z"));
+
+    // A resumes and observes 'member'.
+    parkedA.resolve({ role: "member" });
+    await workerA;
+    await flush();
+
+    // A must not perform the destructive removal nor stamp a terminal state,
+    // because its lease expired.
+    expect(mockGithubClient.removeTeamMember).not.toHaveBeenCalled();
+    expect(grantRepo.getGrant("grant-self-expire")!.status).toBe("revoking");
+    // The lease it stamped is still there (it never legitimately released it).
+    expect(grantRepo.getGrant("grant-self-expire")!.revoking_lease_id).toEqual(
+      expect.any(String),
+    );
+  });
+
   it("fences a resumed worker whose lease was reclaimed and completed", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
@@ -322,7 +361,9 @@ describe("revoke lease fencing", () => {
     // let the membership check pass, then park the removal call itself.
     mockGithubClient.getTeamMembership.mockResolvedValue({ role: "member" });
     const parkedRemoval = deferred<void>();
-    mockGithubClient.removeTeamMember.mockReturnValueOnce(parkedRemoval.promise);
+    mockGithubClient.removeTeamMember.mockReturnValueOnce(
+      parkedRemoval.promise,
+    );
 
     const workerA = buildService().revoke(
       grantRepo.getGrant("grant-overwrite")!,

@@ -57,7 +57,10 @@ describe("stranded revoking grants", () => {
   const expiredAt = () => new Date(Date.now() - 60_000).toISOString();
 
   /** Seed an expired grant already parked in 'revoking'. */
-  const seedStrandedGrant = (grantId: string, leaseStartedAt: string | null) => {
+  const seedStrandedGrant = (
+    grantId: string,
+    leaseStartedAt: string | null,
+  ) => {
     const timestamp = new Date().toISOString();
     grantRepo.createGrant({
       id: grantId,

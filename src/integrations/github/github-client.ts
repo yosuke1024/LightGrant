@@ -90,12 +90,12 @@ export class GitHubClient implements GitHubAccessProvider {
     });
   }
 
-  private async getInstallationClient(): Promise<Octokit> {
+  private async getInstallationClient(signal?: AbortSignal): Promise<Octokit> {
     if (this.installationId !== null) {
       return this.app.getInstallationOctokit(this.installationId);
     }
 
-    const inst = await this.resolveInstallation();
+    const inst = await this.resolveInstallation(signal);
     this.installationId = inst.id;
     this.orgId = inst.targetId;
     return this.app.getInstallationOctokit(this.installationId);
@@ -189,12 +189,13 @@ export class GitHubClient implements GitHubAccessProvider {
     }
   }
 
-  async resolveInstallation(): Promise<GitHubInstallation> {
+  async resolveInstallation(signal?: AbortSignal): Promise<GitHubInstallation> {
     try {
       const response = await this.app.octokit.request(
         "GET /orgs/{org}/installation",
         {
           org: this.org,
+          request: signal ? { signal } : undefined,
         },
       );
       const data = response.data;
@@ -279,7 +280,8 @@ export class GitHubClient implements GitHubAccessProvider {
         orgId: this.orgId || 0,
         githubUserId,
         githubLogin: login,
-        role: (response.data.role === "admin" ? "admin" : "member") as "admin" | "member",
+        role: (response.data.role === "admin" ? "admin" : "member") as
+          "admin" | "member",
         state: response.data.state,
       };
     } catch (error) {
@@ -295,12 +297,12 @@ export class GitHubClient implements GitHubAccessProvider {
     // under the revoke lease; see GITHUB_REQUEST_TIMEOUT_MS.
     return withRequestTimeout(async (signal) => {
       try {
-        const client = await this.getInstallationClient();
+        const client = await this.getInstallationClient(signal);
         const login = await this.getLoginByUserId(githubUserId, client, signal);
 
         try {
           if (!this.orgId) {
-            const inst = await this.resolveInstallation();
+            const inst = await this.resolveInstallation(signal);
             this.orgId = inst.targetId;
           }
 
@@ -376,11 +378,11 @@ export class GitHubClient implements GitHubAccessProvider {
     // as a transient error, so it retries instead of hanging past the lease.
     return withRequestTimeout(async (signal) => {
       try {
-        const client = await this.getInstallationClient();
+        const client = await this.getInstallationClient(signal);
         const login = await this.getLoginByUserId(githubUserId, client, signal);
 
         if (!this.orgId) {
-          const inst = await this.resolveInstallation();
+          const inst = await this.resolveInstallation(signal);
           this.orgId = inst.targetId;
         }
 

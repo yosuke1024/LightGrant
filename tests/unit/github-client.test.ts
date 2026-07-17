@@ -232,7 +232,9 @@ describe("GitHubClient", () => {
           new Promise<void>((_resolve, reject) => {
             received = signal;
             signal.addEventListener("abort", () =>
-              reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+              reject(
+                Object.assign(new Error("aborted"), { name: "AbortError" }),
+              ),
             );
           }),
         1000,
@@ -276,12 +278,43 @@ describe("GitHubClient", () => {
         );
 
       const pending = client.getTeamMembership(1, 999);
-      const assertion = expect(pending).rejects.toBeInstanceOf(
-        GitHubTransientError,
-      );
+      const assertion =
+        expect(pending).rejects.toBeInstanceOf(GitHubTransientError);
       await vi.advanceTimersByTimeAsync(GITHUB_REQUEST_TIMEOUT_MS + 10);
 
       await assertion;
+    });
+
+    it("aborts a hung installation lookup and never reaches login/DELETE", async () => {
+      vi.useFakeTimers();
+      // The very first request — the installation lookup — hangs until aborted.
+      // No login lookup or DELETE must follow.
+      let callCount = 0;
+      mockRequest.mockImplementation(
+        (route: string, opts: { request?: { signal?: AbortSignal } }) => {
+          callCount++;
+          return new Promise((_resolve, reject) => {
+            const signal = opts?.request?.signal;
+            signal?.addEventListener("abort", () =>
+              reject(
+                Object.assign(new Error("The operation was aborted"), {
+                  name: "AbortError",
+                }),
+              ),
+            );
+          });
+        },
+      );
+
+      const pending = client.removeTeamMember(1, 999);
+      const assertion =
+        expect(pending).rejects.toBeInstanceOf(GitHubTransientError);
+      await vi.advanceTimersByTimeAsync(GITHUB_REQUEST_TIMEOUT_MS + 10);
+
+      await assertion;
+      // Only the installation lookup was attempted; the hung request was
+      // aborted before login lookup or the DELETE could be issued.
+      expect(callCount).toBe(1);
     });
 
     it("maps a removeTeamMember timeout to a retryable transient error", async () => {
@@ -311,9 +344,8 @@ describe("GitHubClient", () => {
         );
 
       const pending = client.removeTeamMember(1, 999);
-      const assertion = expect(pending).rejects.toBeInstanceOf(
-        GitHubTransientError,
-      );
+      const assertion =
+        expect(pending).rejects.toBeInstanceOf(GitHubTransientError);
       await vi.advanceTimersByTimeAsync(GITHUB_REQUEST_TIMEOUT_MS + 10);
 
       await assertion;

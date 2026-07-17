@@ -139,11 +139,9 @@ export class GrantService {
         // If the existing grant has not been fulfilled yet, ensure the job will run
         if (grant.status === "pending") {
           shouldEnqueueJob = true;
-        } else if (
-          grant.status === "revoking" ||
-          grant.status === "revoke_failed"
-        ) {
-          // Reactivate the grant by resetting to pending and setting reactivation_required
+        } else if (grant.status === "revoke_failed") {
+          // A failed revocation has already terminalized — no external DELETE is
+          // in flight — so it is safe to reset to pending and reactivate now.
           const currentExpires = new Date(grant.effective_expires_at).getTime();
           const newExpires = new Date(requestedExpiresAt).getTime();
           const targetExpires =
@@ -170,6 +168,34 @@ export class GrantService {
             payloadJson: JSON.stringify({
               previous_status: grant.status,
               extended_expires_at: targetExpires,
+            }),
+          });
+        } else if (grant.status === "revoking") {
+          // A revocation may be mid-DELETE. Do NOT flip to 'pending' or clear
+          // the lease here: doing so would let grant_access activate the grant
+          // while the DELETE is still in flight, leaving the DB active but the
+          // GitHub membership removed. Instead record the reactivation intent
+          // atomically (request link + extended expiry above, the flag and job
+          // here) and leave the grant in 'revoking'. The revocation itself
+          // hands the grant back to reactivation once its DELETE settles, and
+          // grant_access takes over if the revoke worker died (stale lease).
+          grantRepo.updateMutationState(grantId, {
+            membershipMutationState: "reactivation_required",
+          });
+          shouldEnqueueJob = true;
+
+          const auditRepo = new AuditRepository(this.db);
+          auditRepo.writeEventTx({
+            eventType: "grant.reactivation_deferred",
+            actorType: params.decisionMode === "auto" ? "system" : "user",
+            actorId: params.approverIdentityId || null,
+            githubOrgId: request.github_org_id,
+            githubUserId: requesterLink.github_user_id,
+            githubTeamId: request.target_team_id,
+            grantId,
+            payloadJson: JSON.stringify({
+              previous_status: grant.status,
+              reason: "revocation_in_flight",
             }),
           });
         }

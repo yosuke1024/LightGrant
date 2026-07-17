@@ -385,6 +385,82 @@ export class GrantRepository {
   }
 
   /**
+   * Hand a grant this run is revoking back to reactivation, fenced by the
+   * lease. Used when a new request arrived after the destructive DELETE had
+   * begun: the revocation completed the removal, but rather than finalizing to
+   * 'revoked' it moves the grant to 'pending' with reactivation_required so
+   * grant_access re-verifies membership and re-adds it. Keeps the (already
+   * extended) expiry, clears the revoke bookkeeping and the lease.
+   *
+   * @returns true when the fenced transition landed; false means the lease was
+   * lost and a later stale-takeover will drive the reactivation instead.
+   */
+  reactivateOwnedRevokeWithLease(
+    id: string,
+    leaseId: string,
+    staleRevokingBefore: string,
+  ): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'pending',
+          membership_mutation_state = 'reactivation_required',
+          next_revoke_attempt_at = NULL,
+          revoke_attempt_count = 0,
+          revoked_at = NULL,
+          revoking_started_at = NULL,
+          revoking_lease_id = NULL,
+          updated_at = ?
+      WHERE id = ?
+        AND status = 'revoking'
+        AND revoking_lease_id = ?
+        AND revoking_started_at IS NOT NULL
+        AND revoking_started_at > ?
+    `,
+      )
+      .run(now, id, leaseId, staleRevokingBefore);
+    return result.changes === 1;
+  }
+
+  /**
+   * Take over a grant stranded in 'revoking' with a pending reactivation whose
+   * revoke worker died (its lease has gone stale). This is grant_access's
+   * recovery hook: it reclaims the grant to 'pending' so the reactivation flow
+   * can proceed. Gated on a stale/absent lease so it never races a revocation
+   * that is still in flight, and on reactivation_required so it only ever
+   * rescues grants a request is actively trying to restore.
+   *
+   * @returns true when the takeover landed.
+   */
+  reclaimStrandedReactivation(
+    id: string,
+    staleRevokingBefore: string,
+  ): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'pending',
+          next_revoke_attempt_at = NULL,
+          revoke_attempt_count = 0,
+          revoked_at = NULL,
+          revoking_started_at = NULL,
+          revoking_lease_id = NULL,
+          updated_at = ?
+      WHERE id = ?
+        AND status = 'revoking'
+        AND membership_mutation_state = 'reactivation_required'
+        AND (revoking_started_at IS NULL OR revoking_started_at <= ?)
+    `,
+      )
+      .run(now, id, staleRevokingBefore);
+    return result.changes === 1;
+  }
+
+  /**
    * Release the revoke lease without changing status. Used when a revocation is
    * cancelled in place (a new active request arrives) so a returning zombie
    * cannot match the token that governed the abandoned run.

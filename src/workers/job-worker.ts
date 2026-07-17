@@ -14,6 +14,7 @@ import { AuditRepository } from "../persistence/repositories/audit-repository.js
 import { GitHubOrganizationContext } from "../domain/github-organization-context.js";
 import crypto from "crypto";
 import { GitHubAccessProvider } from "../integrations/github/github-client.js";
+import { staleRevokingBefore } from "../services/revocation-service.js";
 
 export class JobWorker {
   private jobRepo: JobRepository;
@@ -101,7 +102,7 @@ export class JobWorker {
   private recoverStaleWebhookDeliveries(): void {
     const now = new Date().toISOString();
     const nowMs = Date.now();
-    
+
     // Run every 60 seconds (1 minute interval)
     if (nowMs - this.lastWebhookRecoveryAt < 60 * 1000) {
       return;
@@ -180,7 +181,10 @@ export class JobWorker {
             });
 
             logger.info(
-              { deliveryId: delivery.delivery_id, attemptCount: delivery.attempt_count },
+              {
+                deliveryId: delivery.delivery_id,
+                attemptCount: delivery.attempt_count,
+              },
               "Enqueued webhook reprocess job after lease expired",
             );
           } else {
@@ -197,7 +201,10 @@ export class JobWorker {
             });
 
             logger.error(
-              { deliveryId: delivery.delivery_id, attemptCount: delivery.attempt_count },
+              {
+                deliveryId: delivery.delivery_id,
+                attemptCount: delivery.attempt_count,
+              },
               "Webhook delivery permanently failed: retry limit reached",
             );
           }
@@ -251,17 +258,26 @@ export class JobWorker {
       this.jobRepo.completeJob(job.id);
     } else if (job.type === "validate_policy_authority") {
       await this.handleValidatePolicyAuthority(job);
-    } else if (job.type === "notify_request_result" || job.type === "notify_revocation_result") {
+    } else if (
+      job.type === "notify_request_result" ||
+      job.type === "notify_revocation_result"
+    ) {
       await this.handleNotifyRequestResult(job);
     } else if (job.type === "post_audit_notification") {
       await this.handlePostAuditNotification(job);
     } else if (job.type === "reprocess_webhook") {
       const { deliveryId } = JSON.parse(job.payload_json);
       const { WebhookService } = await import("../services/webhook-service.js");
-      const webhookService = new WebhookService(this.db, this.orgContext, this.githubClient);
+      const webhookService = new WebhookService(
+        this.db,
+        this.orgContext,
+        this.githubClient,
+      );
       const success = await webhookService.reprocessDelivery(deliveryId);
       if (!success) {
-        throw new Error(`Reprocessing failed for webhook delivery ${deliveryId}`);
+        throw new Error(
+          `Reprocessing failed for webhook delivery ${deliveryId}`,
+        );
       }
       this.jobRepo.completeJob(job.id);
     } else {
@@ -349,10 +365,11 @@ export class JobWorker {
    */
   private claimVerifiedAddedMembership(grantId: string): void {
     const verifiedAt = new Date().toISOString();
-    const claimed = this.grantRepo.confirmMembershipCreatedByAppAfterVerifiedAdd(
-      grantId,
-      verifiedAt,
-    );
+    const claimed =
+      this.grantRepo.confirmMembershipCreatedByAppAfterVerifiedAdd(
+        grantId,
+        verifiedAt,
+      );
     if (claimed) return;
 
     // The grant left 'add_request_sent' under us, so we cannot attribute the
@@ -373,6 +390,46 @@ export class JobWorker {
     const grant = this.grantRepo.getGrant(grantId);
     if (!grant) {
       throw new Error(`Grant ${grantId} not found in database`);
+    }
+
+    // A grant still in 'revoking' has a revocation that may be mid-DELETE.
+    // Activating it now could race that removal and leave the DB active with
+    // the GitHub membership gone. Two cases:
+    //   * the revoke worker is alive (fresh lease) -> wait: defer this job
+    //     without charging a retry attempt, until the revocation settles;
+    //   * the revoke worker died mid-flight (stale lease) and a reactivation
+    //     is pending -> take over the reactivation ourselves.
+    if (grant.status === "revoking") {
+      const stale = staleRevokingBefore(new Date().toISOString());
+      const tookOver =
+        grant.membership_mutation_state === "reactivation_required" &&
+        this.grantRepo.reclaimStrandedReactivation(grantId, stale);
+
+      if (tookOver) {
+        logger.warn(
+          { grantId },
+          "Revoke worker abandoned a reactivating grant; grant_access taking over",
+        );
+        const fresh = this.grantRepo.getGrant(grantId)!;
+        grant.status = fresh.status;
+        grant.membership_mutation_state = fresh.membership_mutation_state;
+        grant.revoked_at = fresh.revoked_at;
+        grant.revoking_started_at = fresh.revoking_started_at;
+        grant.revoking_lease_id = fresh.revoking_lease_id;
+        // fall through to the reactivation flow with a 'pending' grant.
+      } else {
+        const nextRunAfter = new Date(Date.now() + 15 * 1000).toISOString();
+        logger.info(
+          { grantId },
+          "Grant is revoking; deferring grant_access until revocation settles",
+        );
+        this.jobRepo.deferJob(
+          job.id,
+          nextRunAfter,
+          "waiting for revocation to settle",
+        );
+        return;
+      }
     }
 
     // Check if the grant is already in a completed state
@@ -960,7 +1017,8 @@ export class JobWorker {
               "maintainer",
             );
           } else {
-            const nextStatus = grant.status === "revoke_failed" ? "revoke_failed" : "active";
+            const nextStatus =
+              grant.status === "revoke_failed" ? "revoke_failed" : "active";
             this.grantRepo.updateGrantStatusAndMembership(
               grantId,
               nextStatus,
@@ -1193,7 +1251,8 @@ export class JobWorker {
                 operation_id: grant.membership_add_operation_id,
                 previous_mutation_state: "add_request_sent",
                 observed_role: "maintainer",
-                recovery_reason: "membership_present_as_maintainer_after_timeout",
+                recovery_reason:
+                  "membership_present_as_maintainer_after_timeout",
               }),
             });
           } else {
@@ -1463,7 +1522,10 @@ export class JobWorker {
             ).AuditRepository(this.db);
 
             this.db.transaction(() => {
-              this.jobRepo.failJob(job.id, redactMessage(typedErr.message || "Max attempts reached"));
+              this.jobRepo.failJob(
+                job.id,
+                redactMessage(typedErr.message || "Max attempts reached"),
+              );
               this.grantRepo.updateGrantStatus(
                 grantId,
                 "grant_failed",
@@ -1471,7 +1533,7 @@ export class JobWorker {
                 "max_attempts_exceeded",
                 redactMessage(typedErr.message || "Max attempts reached"),
               );
- 
+
               auditRepo.writeEventTx({
                 eventType: "grant.failed",
                 actorType: "system",
@@ -1481,12 +1543,17 @@ export class JobWorker {
                 grantId,
                 payloadJson: JSON.stringify({
                   error_code: "max_attempts_exceeded",
-                  error_message: redactMessage(typedErr.message || "Max attempts reached"),
+                  error_message: redactMessage(
+                    typedErr.message || "Max attempts reached",
+                  ),
                 }),
               });
             })();
           } else {
-            this.jobRepo.failJob(job.id, redactMessage(typedErr.message || "Max attempts reached"));
+            this.jobRepo.failJob(
+              job.id,
+              redactMessage(typedErr.message || "Max attempts reached"),
+            );
           }
         } else {
           await this.releaseJobForRetry(job, err);
@@ -1507,13 +1574,17 @@ export class JobWorker {
             await import("../persistence/repositories/audit-repository.js")
           ).AuditRepository(this.db);
 
-          const nextAttemptAt = new Date(Date.now() + 3600 * 1000).toISOString();
+          const nextAttemptAt = new Date(
+            Date.now() + 3600 * 1000,
+          ).toISOString();
 
           this.db.transaction(() => {
             this.jobRepo.releaseJobForRetry(
               job.id,
               nextAttemptAt,
-              redactMessage(typedErr.message || "Revocation failed, retrying in 1 hour"),
+              redactMessage(
+                typedErr.message || "Revocation failed, retrying in 1 hour",
+              ),
             );
 
             this.grantRepo.updateRevocationStatus(grantId, {
@@ -1522,7 +1593,9 @@ export class JobWorker {
               attemptCount: grant.revoke_attempt_count + 1,
               nextAttemptAt: nextAttemptAt,
               errorCode: typedErr.status ? String(typedErr.status) : "ERROR",
-              errorMessage: redactMessage(typedErr.message || "Unknown revocation error"),
+              errorMessage: redactMessage(
+                typedErr.message || "Unknown revocation error",
+              ),
             });
 
             auditRepo.writeEventTx({
@@ -1555,13 +1628,21 @@ export class JobWorker {
           const idempotencyKey = this.extractIdempotencyKey(job);
           if (idempotencyKey) {
             this.db.transaction(() => {
-              this.db.prepare(
-                `UPDATE notification_deliveries SET status = 'dead', updated_at = ? WHERE idempotency_key = ?`
-              ).run(new Date().toISOString(), idempotencyKey);
-              this.jobRepo.failJob(job.id, redactMessage(typedErr.message || "Max attempts reached"));
+              this.db
+                .prepare(
+                  `UPDATE notification_deliveries SET status = 'dead', updated_at = ? WHERE idempotency_key = ?`,
+                )
+                .run(new Date().toISOString(), idempotencyKey);
+              this.jobRepo.failJob(
+                job.id,
+                redactMessage(typedErr.message || "Max attempts reached"),
+              );
             })();
           } else {
-            this.jobRepo.failJob(job.id, redactMessage(typedErr.message || "Max attempts reached"));
+            this.jobRepo.failJob(
+              job.id,
+              redactMessage(typedErr.message || "Max attempts reached"),
+            );
           }
         } else {
           await this.releaseJobForRetry(job, err);
@@ -1575,7 +1656,10 @@ export class JobWorker {
             { jobId: job.id },
             "refresh_team_cache reached maximum attempts. Marking failed. Existing cache is maintained.",
           );
-          this.jobRepo.failJob(job.id, redactMessage(typedErr.message || "Max attempts reached"));
+          this.jobRepo.failJob(
+            job.id,
+            redactMessage(typedErr.message || "Max attempts reached"),
+          );
         } else {
           await this.releaseJobForRetry(job, err);
         }
@@ -1591,14 +1675,19 @@ export class JobWorker {
           const auditRepo = new (
             await import("../persistence/repositories/audit-repository.js")
           ).AuditRepository(this.db);
-          
+
           this.db.transaction(() => {
-            this.jobRepo.failJob(job.id, redactMessage(typedErr.message || "Max attempts reached"));
+            this.jobRepo.failJob(
+              job.id,
+              redactMessage(typedErr.message || "Max attempts reached"),
+            );
             auditRepo.writeEventTx({
               eventType: "policy.validation_failed_permanently",
               actorType: "system",
               payloadJson: JSON.stringify({
-                error: redactMessage(typedErr.message || "Max attempts reached"),
+                error: redactMessage(
+                  typedErr.message || "Max attempts reached",
+                ),
               }),
             });
           })();
@@ -1610,8 +1699,14 @@ export class JobWorker {
 
       default: {
         if (isPermanentFailure) {
-          logger.error({ jobId: job.id }, "Generic job failure permanently failed.");
-          this.jobRepo.failJob(job.id, redactMessage(typedErr.message || "Max attempts reached"));
+          logger.error(
+            { jobId: job.id },
+            "Generic job failure permanently failed.",
+          );
+          this.jobRepo.failJob(
+            job.id,
+            redactMessage(typedErr.message || "Max attempts reached"),
+          );
         } else {
           await this.releaseJobForRetry(job, err);
         }
@@ -1631,7 +1726,7 @@ export class JobWorker {
       { jobId: job.id, attempt, nextRunAfter },
       "Releasing job for retry",
     );
-    
+
     const redactMessage = (msg: string): string => {
       if (!msg) return msg;
       return msg
@@ -1698,7 +1793,8 @@ export class JobWorker {
         .prepare(
           "SELECT * FROM notification_deliveries WHERE idempotency_key = ?",
         )
-        .get(idempotencyKey) as { id: string; status: string; attempt_count: number } | undefined;
+        .get(idempotencyKey) as
+        { id: string; status: string; attempt_count: number } | undefined;
       if (!row) {
         const id = crypto.randomUUID();
         this.db
@@ -1714,7 +1810,8 @@ export class JobWorker {
           .prepare(
             "SELECT * FROM notification_deliveries WHERE idempotency_key = ?",
           )
-          .get(idempotencyKey) as { id: string; status: string; attempt_count: number } | undefined;
+          .get(idempotencyKey) as
+          { id: string; status: string; attempt_count: number } | undefined;
       }
       return row;
     })() as { id: string; status: string; attempt_count: number };
@@ -1844,7 +1941,8 @@ export class JobWorker {
         .prepare(
           "SELECT * FROM notification_deliveries WHERE idempotency_key = ?",
         )
-        .get(idempotencyKey) as { id: string; status: string; attempt_count: number } | undefined;
+        .get(idempotencyKey) as
+        { id: string; status: string; attempt_count: number } | undefined;
       if (!row) {
         const id = crypto.randomUUID();
         this.db
@@ -1867,7 +1965,8 @@ export class JobWorker {
           .prepare(
             "SELECT * FROM notification_deliveries WHERE idempotency_key = ?",
           )
-          .get(idempotencyKey) as { id: string; status: string; attempt_count: number } | undefined;
+          .get(idempotencyKey) as
+          { id: string; status: string; attempt_count: number } | undefined;
       }
       return row;
     })() as { id: string; status: string; attempt_count: number };

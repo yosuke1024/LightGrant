@@ -32,7 +32,9 @@ export const REVOKE_LEASE_SECONDS = 15 * 60;
 
 /** The instant at or before which a 'revoking' lease counts as abandoned. */
 export function staleRevokingBefore(nowStr: string): string {
-  return new Date(Date.parse(nowStr) - REVOKE_LEASE_SECONDS * 1000).toISOString();
+  return new Date(
+    Date.parse(nowStr) - REVOKE_LEASE_SECONDS * 1000,
+  ).toISOString();
 }
 
 export class RevocationService {
@@ -43,12 +45,85 @@ export class RevocationService {
   ) {}
 
   /**
+   * The lease-staleness cutoff for *right now*, re-read at each fence point.
+   *
+   * A revocation may stall (a slow or hung GitHub call) for longer than the
+   * lease window. The cutoff must therefore be recomputed from the current
+   * clock every time we test ownership — never frozen at revoke() start —
+   * or a worker that overran its lease would still see its own lease as live
+   * and resume destructive work in the very window where a reclaimer is about
+   * to take over. Reads the clock via `new Date()` so fake timers drive it
+   * deterministically in tests.
+   */
+  private currentStale(): string {
+    return staleRevokingBefore(new Date().toISOString());
+  }
+
+  /**
+   * If a new request has asked for this grant back while we were revoking,
+   * hand the grant to reactivation instead of finalizing it 'revoked'. The
+   * membership has just been removed (or was already absent), so grant_access
+   * must re-verify and re-add it; finalizing 'revoked' would leave the DB
+   * saying the grant is gone while a request is actively restoring it. The
+   * transition is fenced by the lease, so a worker that lost the lease does
+   * nothing here and the stale-takeover in grant_access recovers instead.
+   *
+   * @returns true when a reactivation was pending (caller must NOT continue to
+   * the 'revoked' finalize, whether or not the fenced transition landed).
+   */
+  private handBackToReactivationIfRequested(
+    grantRepo: GrantRepository,
+    auditRepo: AuditRepository,
+    activeGrant: DbGrant,
+    leaseId: string,
+  ): boolean {
+    const fresh = grantRepo.getGrant(activeGrant.id);
+    if (!fresh || fresh.membership_mutation_state !== "reactivation_required") {
+      return false;
+    }
+
+    this.db.transaction(() => {
+      const reactivated = grantRepo.reactivateOwnedRevokeWithLease(
+        activeGrant.id,
+        leaseId,
+        this.currentStale(),
+      );
+      if (!reactivated) {
+        logger.warn(
+          { grantId: activeGrant.id },
+          "Revoke lease lost before handing back to reactivation; stale takeover will recover",
+        );
+        return;
+      }
+      auditRepo.writeEventTx({
+        eventType: "revoke.handed_back_to_reactivation",
+        actorType: "system",
+        githubOrgId: activeGrant.github_org_id,
+        githubUserId: activeGrant.github_user_id,
+        githubTeamId: activeGrant.target_team_id,
+        grantId: activeGrant.id,
+        payloadJson: JSON.stringify({
+          reason: "new_request_during_revocation",
+        }),
+      });
+      logger.info(
+        { grantId: activeGrant.id },
+        "Membership removed but a reactivation is pending; handing grant back to reactivation",
+      );
+    })();
+    return true;
+  }
+
+  /**
    * Safe revocation check and execution.
    * Leverages Compare-and-Set and live verification checks to prevent removing Maintainers.
    */
   async revoke(grant: DbGrant, nowStr?: string): Promise<void> {
     const now = nowStr || new Date().toISOString();
-    const stale = staleRevokingBefore(now);
+    // Cutoff for judging the EXISTING lease at acquisition time only. Every
+    // later ownership test recomputes its own cutoff via currentStale(), so a
+    // stall past the lease window is caught. See currentStale().
+    const acquisitionStale = staleRevokingBefore(now);
     const grantRepo = new GrantRepository(this.db);
     const identityRepo = new IdentityRepository(this.db);
 
@@ -81,7 +156,7 @@ export class RevocationService {
         grant.id,
         leaseId,
         now,
-        stale,
+        acquisitionStale,
       );
 
       if (!acquired) {
@@ -135,14 +210,19 @@ export class RevocationService {
 
       const won = this.db.transaction(() => {
         if (
-          !grantRepo.finalizeRevocationWithLease(activeGrant.id, leaseId, stale, {
-            status: "revoked",
-            revokedAt: now,
-            attemptCount: activeGrant.revoke_attempt_count,
-            nextAttemptAt: null,
-            errorCode: null,
-            errorMessage: null,
-          })
+          !grantRepo.finalizeRevocationWithLease(
+            activeGrant.id,
+            leaseId,
+            this.currentStale(),
+            {
+              status: "revoked",
+              revokedAt: now,
+              attemptCount: activeGrant.revoke_attempt_count,
+              nextAttemptAt: null,
+              errorCode: null,
+              errorMessage: null,
+            },
+          )
         ) {
           return false;
         }
@@ -216,6 +296,19 @@ export class RevocationService {
 
       // 3.1. Membership absent -> count as success
       if (!currentRole) {
+        // A request may have arrived to restore this grant; if so, hand it to
+        // reactivation rather than marking it revoked.
+        if (
+          this.handBackToReactivationIfRequested(
+            grantRepo,
+            auditRepo,
+            activeGrant,
+            leaseId,
+          )
+        ) {
+          return;
+        }
+
         logger.info(
           { grantId: activeGrant.id },
           "Membership is already absent, completing revocation",
@@ -226,7 +319,7 @@ export class RevocationService {
             !grantRepo.finalizeRevocationWithLease(
               activeGrant.id,
               leaseId,
-              stale,
+              this.currentStale(),
               {
                 status: "revoked",
                 revokedAt: now,
@@ -309,7 +402,7 @@ export class RevocationService {
             !grantRepo.finalizeRevocationWithLease(
               activeGrant.id,
               leaseId,
-              stale,
+              this.currentStale(),
               {
                 status: "revoke_failed",
                 revokedAt: null,
@@ -368,7 +461,13 @@ export class RevocationService {
       // or a new request reactivated it) fails this check and stops here — it
       // must never remove a member the current owner may have reinstated.
       const cancelRevoke = await (async () => {
-        if (!grantRepo.ownsRevokeLease(activeGrant.id, leaseId, stale)) {
+        if (
+          !grantRepo.ownsRevokeLease(
+            activeGrant.id,
+            leaseId,
+            this.currentStale(),
+          )
+        ) {
           logger.warn(
             { grantId: activeGrant.id },
             "Revoke lease lost before removal (reclaimed or reactivated); aborting",
@@ -457,6 +556,20 @@ export class RevocationService {
       }
 
       if (!verifiedRole) {
+        // The removal succeeded. If a request arrived to restore this grant
+        // while the DELETE was in flight, hand it to reactivation (which will
+        // re-add the now-removed membership) instead of finalizing 'revoked'.
+        if (
+          this.handBackToReactivationIfRequested(
+            grantRepo,
+            auditRepo,
+            activeGrant,
+            leaseId,
+          )
+        ) {
+          return;
+        }
+
         logger.info(
           { grantId: activeGrant.id },
           "Team membership removal verified",
@@ -467,7 +580,7 @@ export class RevocationService {
             !grantRepo.finalizeRevocationWithLease(
               activeGrant.id,
               leaseId,
-              stale,
+              this.currentStale(),
               {
                 status: "revoked",
                 revokedAt: now,
@@ -558,14 +671,19 @@ export class RevocationService {
 
       const won = this.db.transaction(() => {
         if (
-          !grantRepo.finalizeRevocationWithLease(activeGrant.id, leaseId, stale, {
-            status: "revoke_failed",
-            revokedAt: null,
-            attemptCount,
-            nextAttemptAt,
-            errorCode,
-            errorMessage,
-          })
+          !grantRepo.finalizeRevocationWithLease(
+            activeGrant.id,
+            leaseId,
+            this.currentStale(),
+            {
+              status: "revoke_failed",
+              revokedAt: null,
+              attemptCount,
+              nextAttemptAt,
+              errorCode,
+              errorMessage,
+            },
+          )
         ) {
           return false;
         }
