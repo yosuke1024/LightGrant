@@ -27,6 +27,15 @@ export interface DbGrant {
   membership_add_last_verified_at: string | null;
   last_revoke_alert_at: string | null;
   last_revoke_alert_reason: string | null;
+  /** When this grant entered 'revoking'; the lease held by that revocation. */
+  revoking_started_at: string | null;
+  /**
+   * Unique fencing token for the revocation run that currently owns this
+   * grant. Only the holder of this id may perform the destructive GitHub call
+   * and the terminal DB write; a worker whose id no longer matches has lost
+   * the lease and must abort.
+   */
+  revoking_lease_id: string | null;
 }
 
 export interface CreateGrantInput {
@@ -47,6 +56,13 @@ export interface CreateGrantInput {
   membershipAddOperationId?: string | null;
   membershipAddLastVerifiedAt?: string | null;
 }
+
+/**
+ * Outcome of an atomic successful-revoke settlement. See
+ * {@link GrantRepository.finalizeSuccessfulRevoke}.
+ */
+export type SuccessfulRevokeOutcome =
+  "revoked" | "reactivation_pending" | "lease_lost";
 
 /**
  * Handles operations on the `grants` table in SQLite.
@@ -151,22 +167,36 @@ export class GrantRepository {
 
   /**
    * Retrieve active or failing grants that have expired.
+   *
+   * Grants parked in 'revoking' are included once their revoke lease has gone
+   * stale. A revocation that dies partway through leaves the grant in that
+   * state, and without this sweep nothing would ever select it again: the
+   * grant would keep its access forever. A lease newer than
+   * staleRevokingBefore means a revocation is still in flight, so it is left
+   * alone. A missing lease records no live claim and is reclaimable.
+   *
+   * @param staleRevokingBefore ISO instant; 'revoking' grants leased at or
+   * before this are considered abandoned.
    */
-  getExpiredGrants(nowStr: string): DbGrant[] {
+  getExpiredGrants(nowStr: string, staleRevokingBefore: string): DbGrant[] {
     const rows = this.db
       .prepare(
         `
       SELECT * FROM grants
-      WHERE status IN ('active', 'revoke_failed', 'already_present')
+      WHERE status IN ('active', 'revoke_failed', 'already_present', 'revoking')
         AND effective_expires_at <= ?
         AND (
           status IN ('active', 'already_present')
-          OR next_revoke_attempt_at <= ?
+          OR (status = 'revoke_failed' AND next_revoke_attempt_at <= ?)
+          OR (
+            status = 'revoking'
+            AND (revoking_started_at IS NULL OR revoking_started_at <= ?)
+          )
         )
         AND revoked_at IS NULL
     `,
       )
-      .all(nowStr, nowStr);
+      .all(nowStr, nowStr, staleRevokingBefore);
     return (rows as DbGrant[]) || [];
   }
 
@@ -228,6 +258,284 @@ export class GrantRepository {
         now,
         id,
       );
+  }
+
+  /**
+   * Take the revoke lease for a grant, stamping a fresh fencing token.
+   *
+   * A grant is leasable when it is in a revocable state, or already in
+   * 'revoking' but with a stale/absent lease (its previous owner died). The
+   * update is a Compare-and-Set: it succeeds for exactly one racing worker and
+   * hands that worker a unique `leaseId` that fences every later step of its
+   * run. A revocation still in flight (fresh lease) is left untouched.
+   *
+   * @param staleRevokingBefore ISO instant; a 'revoking' lease taken at or
+   * before this counts as abandoned and may be reclaimed.
+   * @returns true when this caller took the lease.
+   */
+  acquireRevokeLease(
+    id: string,
+    leaseId: string,
+    nowStr: string,
+    staleRevokingBefore: string,
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'revoking',
+          revoking_started_at = ?,
+          revoking_lease_id = ?,
+          updated_at = ?
+      WHERE id = ?
+        AND (
+          status IN ('active', 'revoke_failed', 'already_present')
+          OR (
+            status = 'revoking'
+            AND (revoking_started_at IS NULL OR revoking_started_at <= ?)
+          )
+        )
+    `,
+      )
+      .run(nowStr, leaseId, nowStr, id, staleRevokingBefore);
+    return result.changes === 1;
+  }
+
+  /**
+   * Whether this run still owns the revoke lease for a grant.
+   *
+   * Ownership means the grant is still 'revoking', still carries this run's
+   * fencing token, and the lease has not gone stale. Callers check this
+   * immediately before an irreversible GitHub mutation so a worker that lost
+   * its lease never removes a member the current owner may have already
+   * reinstated.
+   */
+  ownsRevokeLease(
+    id: string,
+    leaseId: string,
+    staleRevokingBefore: string,
+  ): boolean {
+    const row = this.db
+      .prepare(
+        `
+      SELECT 1 AS present FROM grants
+      WHERE id = ?
+        AND status = 'revoking'
+        AND revoking_lease_id = ?
+        AND revoking_started_at IS NOT NULL
+        AND revoking_started_at > ?
+    `,
+      )
+      .get(id, leaseId, staleRevokingBefore);
+    return !!row;
+  }
+
+  /**
+   * Write a terminal revocation outcome, but only if this run still holds the
+   * lease. The fencing predicate (status = 'revoking', matching lease id, lease
+   * not stale) makes the write a no-op for a worker whose lease was reclaimed,
+   * so it can never overwrite the new owner's result or a later reactivation.
+   * On success the lease is released (both lease columns cleared) since the
+   * grant is leaving 'revoking'.
+   *
+   * @returns true when the fenced write landed; false means the lease was lost
+   * and the caller must stop without side effects.
+   */
+  finalizeRevocationWithLease(
+    id: string,
+    leaseId: string,
+    staleRevokingBefore: string,
+    params: {
+      status: string;
+      revokedAt: string | null;
+      attemptCount: number;
+      nextAttemptAt: string | null;
+      errorCode: string | null;
+      errorMessage: string | null;
+    },
+  ): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET
+        status = ?,
+        revoked_at = ?,
+        revoke_attempt_count = ?,
+        next_revoke_attempt_at = ?,
+        last_error_code = ?,
+        last_error_message = ?,
+        revoking_started_at = NULL,
+        revoking_lease_id = NULL,
+        updated_at = ?
+      WHERE id = ?
+        AND status = 'revoking'
+        AND revoking_lease_id = ?
+        AND revoking_started_at IS NOT NULL
+        AND revoking_started_at > ?
+    `,
+      )
+      .run(
+        params.status,
+        params.revokedAt,
+        params.attemptCount,
+        params.nextAttemptAt,
+        params.errorCode,
+        params.errorMessage,
+        now,
+        id,
+        leaseId,
+        staleRevokingBefore,
+      );
+    return result.changes === 1;
+  }
+
+  /**
+   * Atomically settle a successful revocation (membership removed or already
+   * absent), deciding in ONE fenced step between finalizing 'revoked' and
+   * handing the grant back to reactivation.
+   *
+   * Why this is a single operation rather than "check reactivation, then
+   * finalize": a request that reactivates the grant can commit in the gap
+   * between those two writes. If it does, a separate finalize would still set
+   * status='revoked' with a revoked_at, while grant_access re-adds the
+   * membership and never clears revoked_at — so getExpiredGrants()
+   * (`revoked_at IS NULL`) can never reclaim it again and the JIT grant becomes
+   * permanent. Testing `membership_mutation_state` inside the very UPDATE that
+   * performs the transition closes that TOCTOU: the reactivation is either
+   * already visible (we hand back) or not yet committed (we finalize revoked),
+   * with no window in between.
+   *
+   * Both branches are fenced by the lease (status='revoking', matching token,
+   * lease not stale) so a worker that lost the lease no-ops and returns
+   * 'lease_lost'. The reactivation branch wins over the revoked branch when a
+   * reactivation is pending. Callers MUST run this inside the same transaction
+   * as the outcome's audit event / jobs so state and audit commit atomically.
+   *
+   * @returns
+   *  - 'reactivation_pending' — a request asked for the grant back; moved to
+   *    'pending' (revoked_at left NULL) for grant_access to re-add membership.
+   *  - 'revoked' — no reactivation pending; finalized terminal 'revoked'.
+   *  - 'lease_lost' — the lease was reclaimed/stale; nothing was written.
+   */
+  finalizeSuccessfulRevoke(
+    id: string,
+    leaseId: string,
+    staleRevokingBefore: string,
+    revokedAt: string,
+  ): SuccessfulRevokeOutcome {
+    const now = new Date().toISOString();
+
+    // Reactivation branch: fenced AND gated on a pending reactivation. Wins
+    // over the revoked branch below when a request has asked for the grant
+    // back. Keeps the (already extended) expiry and clears revoke bookkeeping.
+    const reactivated = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'pending',
+          next_revoke_attempt_at = NULL,
+          revoke_attempt_count = 0,
+          revoked_at = NULL,
+          revoking_started_at = NULL,
+          revoking_lease_id = NULL,
+          updated_at = ?
+      WHERE id = ?
+        AND status = 'revoking'
+        AND revoking_lease_id = ?
+        AND revoking_started_at IS NOT NULL
+        AND revoking_started_at > ?
+        AND membership_mutation_state = 'reactivation_required'
+    `,
+      )
+      .run(now, id, leaseId, staleRevokingBefore);
+    if (reactivated.changes === 1) return "reactivation_pending";
+
+    // Revoked branch: fenced AND gated on NO pending reactivation. Because a
+    // write transaction holds the SQLite write lock from the statement above
+    // until commit, no reactivation can slip in between the two UPDATEs.
+    const revoked = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'revoked',
+          revoked_at = ?,
+          revoke_attempt_count = 0,
+          next_revoke_attempt_at = NULL,
+          last_error_code = NULL,
+          last_error_message = NULL,
+          revoking_started_at = NULL,
+          revoking_lease_id = NULL,
+          updated_at = ?
+      WHERE id = ?
+        AND status = 'revoking'
+        AND revoking_lease_id = ?
+        AND revoking_started_at IS NOT NULL
+        AND revoking_started_at > ?
+        AND membership_mutation_state != 'reactivation_required'
+    `,
+      )
+      .run(revokedAt, now, id, leaseId, staleRevokingBefore);
+    if (revoked.changes === 1) return "revoked";
+
+    return "lease_lost";
+  }
+
+  /**
+   * Take over a grant stranded in 'revoking' with a pending reactivation whose
+   * revoke worker died (its lease has gone stale). This is grant_access's
+   * recovery hook: it reclaims the grant to 'pending' so the reactivation flow
+   * can proceed. Gated on a stale/absent lease so it never races a revocation
+   * that is still in flight, and on reactivation_required so it only ever
+   * rescues grants a request is actively trying to restore.
+   *
+   * @returns true when the takeover landed.
+   */
+  reclaimStrandedReactivation(
+    id: string,
+    staleRevokingBefore: string,
+  ): boolean {
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET status = 'pending',
+          next_revoke_attempt_at = NULL,
+          revoke_attempt_count = 0,
+          revoked_at = NULL,
+          revoking_started_at = NULL,
+          revoking_lease_id = NULL,
+          updated_at = ?
+      WHERE id = ?
+        AND status = 'revoking'
+        AND membership_mutation_state = 'reactivation_required'
+        AND (revoking_started_at IS NULL OR revoking_started_at <= ?)
+    `,
+      )
+      .run(now, id, staleRevokingBefore);
+    return result.changes === 1;
+  }
+
+  /**
+   * Release the revoke lease without changing status. Used when a revocation is
+   * cancelled in place (a new active request arrives) so a returning zombie
+   * cannot match the token that governed the abandoned run.
+   */
+  clearRevokeLease(id: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `
+      UPDATE grants
+      SET revoking_started_at = NULL,
+          revoking_lease_id = NULL,
+          updated_at = ?
+      WHERE id = ?
+    `,
+      )
+      .run(now, id);
   }
 
   /**
@@ -466,6 +774,12 @@ export class GrantRepository {
   /**
    * Reactivate an existing grant by setting to pending and reactivation_required,
    * clearing revoke attempt count and scheduling.
+   *
+   * Reactivation also releases any revoke lease (revoking_started_at /
+   * revoking_lease_id). A grant may be reactivated while a stale revocation is
+   * still in flight; clearing the lease explicitly expires that run, so a
+   * worker returning from the abandoned revoke can no longer match the token
+   * and remove the member this reactivation just kept.
    */
   reactivateGrant(
     grantId: string,
@@ -483,6 +797,8 @@ export class GrantRepository {
           next_revoke_attempt_at = NULL,
           revoke_attempt_count = 0,
           revoked_at = NULL,
+          revoking_started_at = NULL,
+          revoking_lease_id = NULL,
           updated_at = ?
       WHERE id = ?
     `,

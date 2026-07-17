@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import {
   DbGrant,
   GrantRepository,
+  SuccessfulRevokeOutcome,
 } from "../persistence/repositories/grant-repository.js";
 import { IdentityRepository } from "../persistence/repositories/identity-repository.js";
 import { AuditRepository } from "../persistence/repositories/audit-repository.js";
@@ -18,6 +19,25 @@ export function calculateRevokeRetryDelay(attempt: number): number {
   return 60 * 60; // 1h
 }
 
+/**
+ * How long a revocation may hold a grant in 'revoking' before another run may
+ * take it over.
+ *
+ * A revocation is a handful of GitHub calls and completes in seconds, so this
+ * is set far above any legitimate run: the window only has to be long enough
+ * that we never race a revocation that is merely slow. The cost of the margin
+ * is that access lingers this much past expiry when a process dies mid-revoke,
+ * which is the rarer and less harmful outcome.
+ */
+export const REVOKE_LEASE_SECONDS = 15 * 60;
+
+/** The instant at or before which a 'revoking' lease counts as abandoned. */
+export function staleRevokingBefore(nowStr: string): string {
+  return new Date(
+    Date.parse(nowStr) - REVOKE_LEASE_SECONDS * 1000,
+  ).toISOString();
+}
+
 export class RevocationService {
   constructor(
     private db: Database.Database,
@@ -26,13 +46,158 @@ export class RevocationService {
   ) {}
 
   /**
+   * The lease-staleness cutoff for *right now*, re-read at each fence point.
+   *
+   * A revocation may stall (a slow or hung GitHub call) for longer than the
+   * lease window. The cutoff must therefore be recomputed from the current
+   * clock every time we test ownership — never frozen at revoke() start —
+   * or a worker that overran its lease would still see its own lease as live
+   * and resume destructive work in the very window where a reclaimer is about
+   * to take over. Reads the clock via `new Date()` so fake timers drive it
+   * deterministically in tests.
+   */
+  private currentStale(): string {
+    return staleRevokingBefore(new Date().toISOString());
+  }
+
+  /**
+   * Settle a successful revocation (membership removed or already absent) in a
+   * single transaction, so the state transition and its audit event / jobs
+   * commit together.
+   *
+   * The reactivation-vs-revoked decision is made atomically inside
+   * {@link GrantRepository.finalizeSuccessfulRevoke}: a request that reactivates
+   * the grant is either already visible (we hand back) or not yet committed (we
+   * finalize 'revoked'), with no window in between. This closes the TOCTOU that
+   * a separate "check reactivation, then finalize 'revoked'" opened — where a
+   * request landing in the gap left the grant 'revoked' with a revoked_at while
+   * grant_access re-added the membership, making the JIT grant permanent.
+   *
+   * @param alreadyAbsent whether the membership was already gone before we
+   * acted (path 3.1) vs removed by us and verified (path 3.3); only shapes the
+   * audit payload.
+   * @returns the settled outcome (also logged here).
+   */
+  private completeSuccessfulRevoke(
+    grantRepo: GrantRepository,
+    auditRepo: AuditRepository,
+    activeGrant: DbGrant,
+    leaseId: string,
+    now: string,
+    slackUserId: string | null,
+    githubLogin: string,
+    teamName: string,
+    alreadyAbsent: boolean,
+  ): SuccessfulRevokeOutcome {
+    const outcome = this.db.transaction((): SuccessfulRevokeOutcome => {
+      const result = grantRepo.finalizeSuccessfulRevoke(
+        activeGrant.id,
+        leaseId,
+        this.currentStale(),
+        now,
+      );
+
+      if (result === "lease_lost") {
+        return result;
+      }
+
+      if (result === "reactivation_pending") {
+        auditRepo.writeEventTx({
+          eventType: "revoke.handed_back_to_reactivation",
+          actorType: "system",
+          githubOrgId: activeGrant.github_org_id,
+          githubUserId: activeGrant.github_user_id,
+          githubTeamId: activeGrant.target_team_id,
+          grantId: activeGrant.id,
+          payloadJson: JSON.stringify({
+            reason: "new_request_during_revocation",
+          }),
+        });
+        return result;
+      }
+
+      // result === 'revoked'
+      auditRepo.writeEventTx({
+        eventType: "grant_revoked",
+        actorType: "system",
+        githubOrgId: activeGrant.github_org_id,
+        githubUserId: activeGrant.github_user_id,
+        githubTeamId: activeGrant.target_team_id,
+        grantId: activeGrant.id,
+        payloadJson: JSON.stringify({
+          wasPreexisting: false,
+          ...(alreadyAbsent ? { alreadyAbsent: true } : {}),
+        }),
+      });
+
+      if (slackUserId) {
+        const jobRepo = new JobRepository(this.db);
+        jobRepo.createJob({
+          id: crypto.randomUUID(),
+          type: "notify_request_result",
+          payloadJson: JSON.stringify({
+            requestId: activeGrant.id,
+            slackUserId,
+            teamName,
+            status: "revoked",
+            durationMinutes: 0,
+          }),
+          runAfter: now,
+        });
+
+        jobRepo.createJob({
+          id: crypto.randomUUID(),
+          type: "post_audit_notification",
+          payloadJson: JSON.stringify({
+            eventId: crypto.randomUUID(),
+            eventType: "grant_revoked",
+            grantId: activeGrant.id,
+            slackUserId,
+            githubLogin,
+            teamName,
+            wasPreexisting: false,
+            status: "revoked",
+          }),
+          runAfter: now,
+        });
+      }
+      return result;
+    })();
+
+    if (outcome === "lease_lost") {
+      logger.warn(
+        { grantId: activeGrant.id },
+        "Revoke lease lost before successful-revoke completion; aborting",
+      );
+    } else if (outcome === "reactivation_pending") {
+      logger.info(
+        { grantId: activeGrant.id },
+        "Membership removed but a reactivation is pending; handing grant back to reactivation",
+      );
+    } else {
+      logger.info({ grantId: activeGrant.id }, "Revocation completed");
+    }
+    return outcome;
+  }
+
+  /**
    * Safe revocation check and execution.
    * Leverages Compare-and-Set and live verification checks to prevent removing Maintainers.
    */
   async revoke(grant: DbGrant, nowStr?: string): Promise<void> {
     const now = nowStr || new Date().toISOString();
+    // Cutoff for judging the EXISTING lease at acquisition time only. Every
+    // later ownership test recomputes its own cutoff via currentStale(), so a
+    // stall past the lease window is caught. See currentStale().
+    const acquisitionStale = staleRevokingBefore(now);
     const grantRepo = new GrantRepository(this.db);
     const identityRepo = new IdentityRepository(this.db);
+
+    // A unique fencing token for this revocation run. It is stamped onto the
+    // grant when we take the lease and gates every later destructive step, so
+    // a worker that loses the lease (a fresh worker reclaims the stale grant
+    // under a new token) can no longer act on it. See migration 0014.
+    const leaseId = crypto.randomUUID();
 
     // 1. Transaction to check and transition status
     const transitionTx = this.db.transaction(() => {
@@ -49,23 +214,30 @@ export class RevocationService {
         return null;
       }
 
-      // 1.2. Compare-and-Set Status update to 'revoking'
-      const affected = this.db
-        .prepare(
-          `
-        UPDATE grants
-        SET status = 'revoking', updated_at = ?
-        WHERE id = ? AND status IN ('active', 'revoke_failed', 'already_present')
-      `,
-        )
-        .run(now, grant.id).changes;
+      // 1.2. Compare-and-Set to 'revoking', taking the lease under a fresh
+      // fencing token. A grant already in 'revoking' is only reclaimable once
+      // its lease has gone stale, so this still excludes a revocation in flight
+      // while rescuing one whose process died.
+      const acquired = grantRepo.acquireRevokeLease(
+        grant.id,
+        leaseId,
+        now,
+        acquisitionStale,
+      );
 
-      if (affected !== 1) {
+      if (!acquired) {
         logger.warn(
           { grantId: grant.id },
-          "Grant status is not active/failed/already_present (potential concurrent revocation)",
+          "Grant is not revocable (already revoked, or a revocation is in flight)",
         );
         return null;
+      }
+
+      if (freshGrant.status === "revoking") {
+        logger.warn(
+          { grantId: grant.id, leaseStartedAt: freshGrant.revoking_started_at },
+          "Reclaiming grant abandoned mid-revocation",
+        );
       }
 
       return freshGrant;
@@ -102,15 +274,24 @@ export class RevocationService {
         "Preexisting membership detected, skipping GitHub removal",
       );
 
-      this.db.transaction(() => {
-        grantRepo.updateRevocationStatus(activeGrant.id, {
-          status: "revoked",
-          revokedAt: now,
-          attemptCount: activeGrant.revoke_attempt_count,
-          nextAttemptAt: null,
-          errorCode: null,
-          errorMessage: null,
-        });
+      const won = this.db.transaction(() => {
+        if (
+          !grantRepo.finalizeRevocationWithLease(
+            activeGrant.id,
+            leaseId,
+            this.currentStale(),
+            {
+              status: "revoked",
+              revokedAt: now,
+              attemptCount: activeGrant.revoke_attempt_count,
+              nextAttemptAt: null,
+              errorCode: null,
+              errorMessage: null,
+            },
+          )
+        ) {
+          return false;
+        }
 
         auditRepo.writeEventTx({
           eventType: "grant_revoked",
@@ -153,7 +334,14 @@ export class RevocationService {
             runAfter: now,
           });
         }
+        return true;
       })();
+      if (!won) {
+        logger.warn(
+          { grantId: activeGrant.id },
+          "Revoke lease lost before preexisting-membership completion; aborting",
+        );
+      }
       return;
     }
 
@@ -172,68 +360,26 @@ export class RevocationService {
         }
       }
 
-      // 3.1. Membership absent -> count as success
+      // 3.1. Membership absent -> count as success. The reactivation-vs-revoked
+      // decision (a request may have arrived to restore this grant) is made
+      // atomically inside completeSuccessfulRevoke.
       if (!currentRole) {
         logger.info(
           { grantId: activeGrant.id },
           "Membership is already absent, completing revocation",
         );
 
-        this.db.transaction(() => {
-          grantRepo.updateRevocationStatus(activeGrant.id, {
-            status: "revoked",
-            revokedAt: now,
-            attemptCount: 0,
-            nextAttemptAt: null,
-            errorCode: null,
-            errorMessage: null,
-          });
-
-          auditRepo.writeEventTx({
-            eventType: "grant_revoked",
-            actorType: "system",
-            githubOrgId: activeGrant.github_org_id,
-            githubUserId: activeGrant.github_user_id,
-            githubTeamId: activeGrant.target_team_id,
-            grantId: activeGrant.id,
-            payloadJson: JSON.stringify({
-              wasPreexisting: false,
-              alreadyAbsent: true,
-            }),
-          });
-
-          if (slackUserId) {
-            const jobRepo = new JobRepository(this.db);
-            jobRepo.createJob({
-              id: crypto.randomUUID(),
-              type: "notify_request_result",
-              payloadJson: JSON.stringify({
-                requestId: activeGrant.id,
-                slackUserId,
-                teamName,
-                status: "revoked",
-                durationMinutes: 0,
-              }),
-              runAfter: now,
-            });
-
-            jobRepo.createJob({
-              id: crypto.randomUUID(),
-              type: "post_audit_notification",
-              payloadJson: JSON.stringify({
-                eventId: crypto.randomUUID(),
-                eventType: "grant_revoked",
-                grantId: activeGrant.id,
-                slackUserId,
-                githubLogin,
-                teamName,
-                wasPreexisting: false,
-                status: "revoked",
-              }),
-              runAfter: now,
-            });
-          }
-        })();
+        this.completeSuccessfulRevoke(
+          grantRepo,
+          auditRepo,
+          activeGrant,
+          leaseId,
+          now,
+          slackUserId,
+          githubLogin,
+          teamName,
+          true,
+        );
         return;
       }
 
@@ -246,16 +392,25 @@ export class RevocationService {
 
         const nextAttemptAt = new Date(Date.now() + 3600 * 1000).toISOString();
 
-        this.db.transaction(() => {
-          grantRepo.updateRevocationStatus(activeGrant.id, {
-            status: "revoke_failed",
-            revokedAt: null,
-            attemptCount: activeGrant.revoke_attempt_count + 1,
-            nextAttemptAt: nextAttemptAt,
-            errorCode: "membership_elevated",
-            errorMessage:
-              "Membership was not removed because the user is currently a Maintainer of the team.",
-          });
+        const won = this.db.transaction(() => {
+          if (
+            !grantRepo.finalizeRevocationWithLease(
+              activeGrant.id,
+              leaseId,
+              this.currentStale(),
+              {
+                status: "revoke_failed",
+                revokedAt: null,
+                attemptCount: activeGrant.revoke_attempt_count + 1,
+                nextAttemptAt: nextAttemptAt,
+                errorCode: "membership_elevated",
+                errorMessage:
+                  "Membership was not removed because the user is currently a Maintainer of the team.",
+              },
+            )
+          ) {
+            return false;
+          }
 
           // Write event only on first elevation check to avoid spamming
           const isFirstElevation =
@@ -271,7 +426,15 @@ export class RevocationService {
               payloadJson: JSON.stringify({ reason: "membership_elevated" }),
             });
           }
+          return true;
         })();
+        if (!won) {
+          logger.warn(
+            { grantId: activeGrant.id },
+            "Revoke lease lost before maintainer-protection update; aborting",
+          );
+          return;
+        }
 
         // Trigger alert with suppression logic
         await this.handleAlertNotification(
@@ -285,15 +448,33 @@ export class RevocationService {
         return;
       }
 
-      // 3.3. Role is 'member' -> remove membership
+      // 3.3. Role is 'member' -> remove membership.
+      //
+      // Fence before the destructive call: only the run that still holds this
+      // lease may delete the member. A worker whose lease was reclaimed while
+      // it was verifying membership (a fresh worker took over the stale grant,
+      // or a new request reactivated it) fails this check and stops here — it
+      // must never remove a member the current owner may have reinstated.
       const cancelRevoke = await (async () => {
-        const freshGrant = grantRepo.getGrant(activeGrant.id);
-        if (!freshGrant) return true;
-
         if (
-          freshGrant.status !== "revoking" ||
-          grantRepo.hasActiveRequests(activeGrant.id, now)
+          !grantRepo.ownsRevokeLease(
+            activeGrant.id,
+            leaseId,
+            this.currentStale(),
+          )
         ) {
+          logger.warn(
+            { grantId: activeGrant.id },
+            "Revoke lease lost before removal (reclaimed or reactivated); aborting",
+          );
+          return true;
+        }
+
+        // We still own the lease. A newly approved request may nonetheless have
+        // arrived while we held it; cancel the revocation in place and hand the
+        // grant back for reactivation, releasing the lease as we go.
+        if (grantRepo.hasActiveRequests(activeGrant.id, now)) {
+          const freshGrant = grantRepo.getGrant(activeGrant.id);
           logger.info(
             { grantId: activeGrant.id },
             "Concurrently approved request detected before deletion. Cancelling revocation and queuing reactivation.",
@@ -303,18 +484,18 @@ export class RevocationService {
             await import("../persistence/repositories/job-repository.js")
           ).JobRepository(this.db);
           this.db.transaction(() => {
-            if (freshGrant.status === "revoking") {
-              grantRepo.updateGrantStatus(
-                activeGrant.id,
-                "pending",
-                null,
-                null,
-                null,
-              );
-            }
+            grantRepo.updateGrantStatus(
+              activeGrant.id,
+              "pending",
+              null,
+              null,
+              null,
+            );
             grantRepo.updateMutationState(activeGrant.id, {
               membershipMutationState: "reactivation_required",
             });
+            // Release the lease so the abandoned run's token can never match.
+            grantRepo.clearRevokeLease(activeGrant.id);
 
             // Enqueue grant_access job
             jobRepo.createJob({
@@ -333,7 +514,7 @@ export class RevocationService {
               grantId: activeGrant.id,
               payloadJson: JSON.stringify({
                 reason: "new_active_request_approved_during_revocation",
-                expires_at: freshGrant.effective_expires_at,
+                expires_at: freshGrant?.effective_expires_at,
               }),
             });
           })();
@@ -370,63 +551,26 @@ export class RevocationService {
       }
 
       if (!verifiedRole) {
+        // The removal succeeded. The reactivation-vs-revoked decision (a
+        // request may have arrived to restore this grant while the DELETE was
+        // in flight) is made atomically inside completeSuccessfulRevoke, which
+        // hands the grant back for re-add rather than finalizing 'revoked'.
         logger.info(
           { grantId: activeGrant.id },
           "Team membership removal verified",
         );
 
-        this.db.transaction(() => {
-          grantRepo.updateRevocationStatus(activeGrant.id, {
-            status: "revoked",
-            revokedAt: now,
-            attemptCount: 0,
-            nextAttemptAt: null,
-            errorCode: null,
-            errorMessage: null,
-          });
-
-          auditRepo.writeEventTx({
-            eventType: "grant_revoked",
-            actorType: "system",
-            githubOrgId: activeGrant.github_org_id,
-            githubUserId: activeGrant.github_user_id,
-            githubTeamId: activeGrant.target_team_id,
-            grantId: activeGrant.id,
-            payloadJson: JSON.stringify({ wasPreexisting: false }),
-          });
-
-          if (slackUserId) {
-            const jobRepo = new JobRepository(this.db);
-            jobRepo.createJob({
-              id: crypto.randomUUID(),
-              type: "notify_request_result",
-              payloadJson: JSON.stringify({
-                requestId: activeGrant.id,
-                slackUserId,
-                teamName,
-                status: "revoked",
-                durationMinutes: 0,
-              }),
-              runAfter: now,
-            });
-
-            jobRepo.createJob({
-              id: crypto.randomUUID(),
-              type: "post_audit_notification",
-              payloadJson: JSON.stringify({
-                eventId: crypto.randomUUID(),
-                eventType: "grant_revoked",
-                grantId: activeGrant.id,
-                slackUserId,
-                githubLogin,
-                teamName,
-                wasPreexisting: false,
-                status: "revoked",
-              }),
-              runAfter: now,
-            });
-          }
-        })();
+        this.completeSuccessfulRevoke(
+          grantRepo,
+          auditRepo,
+          activeGrant,
+          leaseId,
+          now,
+          slackUserId,
+          githubLogin,
+          teamName,
+          false,
+        );
       } else {
         throw new Error(
           "GitHub remove team member call succeeded but verified membership was still found",
@@ -449,15 +593,24 @@ export class RevocationService {
         "Revocation attempt failed",
       );
 
-      this.db.transaction(() => {
-        grantRepo.updateRevocationStatus(activeGrant.id, {
-          status: "revoke_failed",
-          revokedAt: null,
-          attemptCount,
-          nextAttemptAt,
-          errorCode,
-          errorMessage,
-        });
+      const won = this.db.transaction(() => {
+        if (
+          !grantRepo.finalizeRevocationWithLease(
+            activeGrant.id,
+            leaseId,
+            this.currentStale(),
+            {
+              status: "revoke_failed",
+              revokedAt: null,
+              attemptCount,
+              nextAttemptAt,
+              errorCode,
+              errorMessage,
+            },
+          )
+        ) {
+          return false;
+        }
 
         auditRepo.writeEventTx({
           eventType: "grant_revocation_failed",
@@ -472,7 +625,15 @@ export class RevocationService {
             attemptCount,
           }),
         });
+        return true;
       })();
+      if (!won) {
+        logger.warn(
+          { grantId: activeGrant.id },
+          "Revoke lease lost before failure record; aborting without alert",
+        );
+        return;
+      }
 
       // Trigger alert with suppression logic
       await this.handleAlertNotification(

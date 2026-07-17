@@ -204,6 +204,35 @@ export class JobRepository {
   }
 
   /**
+   * Re-queue a job to run later WITHOUT charging it a retry attempt.
+   *
+   * Acquisition increments attempt_count up front, so a plain reschedule would
+   * burn the attempt budget while a job is merely waiting on a precondition
+   * (e.g. grant_access waiting for an in-flight revocation to settle). This
+   * decrements attempt_count to offset the acquisition bump, so an unbounded
+   * wait never trips the max-attempts permanent failure. Not a failure path:
+   * it records the deferral reason but leaves the job runnable.
+   */
+  deferJob(id: string, nextRunAfter: string, reason: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `
+      UPDATE jobs
+      SET status = 'queued',
+          run_after = ?,
+          last_error = ?,
+          attempt_count = MAX(attempt_count - 1, 0),
+          locked_at = NULL,
+          locked_by = NULL,
+          updated_at = ?
+      WHERE id = ?
+    `,
+      )
+      .run(nextRunAfter, reason, now, id);
+  }
+
+  /**
    * Mark a job permanently failed.
    */
   failJob(id: string, error: string): void {

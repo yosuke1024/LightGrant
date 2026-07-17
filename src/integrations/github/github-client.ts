@@ -39,6 +39,39 @@ export interface GitHubClientConfig {
   org: string;
 }
 
+/**
+ * Per-request GitHub timeout for revocation-path calls.
+ *
+ * A revocation holds its grant's lease for REVOKE_LEASE_SECONDS (15m); a call
+ * that hung past that window could resume after another worker reclaimed the
+ * grant. This bound is set far below the lease so the request is abandoned —
+ * and retried as a transient failure — long before the lease can go stale.
+ * Kept here rather than importing the service constant to avoid a
+ * service→integration dependency cycle.
+ */
+export const GITHUB_REQUEST_TIMEOUT_MS = 60_000;
+
+/**
+ * Run an Octokit request under a cancellable deadline. The AbortSignal is
+ * propagated into the actual HTTP request (Octokit forwards `request.signal`
+ * to fetch), so on timeout the socket is torn down rather than merely losing
+ * the race — no dangling connection outlives the lease. The aborted fetch
+ * rejects with an AbortError (no HTTP status), which `handleError` maps to a
+ * GitHubTransientError, feeding the existing retry/backoff path.
+ */
+export async function withRequestTimeout<T>(
+  fn: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number = GITHUB_REQUEST_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fn(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export class GitHubClient implements GitHubAccessProvider {
   private app: App;
   private org: string;
@@ -57,12 +90,12 @@ export class GitHubClient implements GitHubAccessProvider {
     });
   }
 
-  private async getInstallationClient(): Promise<Octokit> {
+  private async getInstallationClient(signal?: AbortSignal): Promise<Octokit> {
     if (this.installationId !== null) {
       return this.app.getInstallationOctokit(this.installationId);
     }
 
-    const inst = await this.resolveInstallation();
+    const inst = await this.resolveInstallation(signal);
     this.installationId = inst.id;
     this.orgId = inst.targetId;
     return this.app.getInstallationOctokit(this.installationId);
@@ -143,10 +176,12 @@ export class GitHubClient implements GitHubAccessProvider {
   private async getLoginByUserId(
     githubUserId: number,
     octokit: Octokit,
+    signal?: AbortSignal,
   ): Promise<string> {
     try {
       const response = await octokit.request("GET /user/{account_id}", {
         account_id: githubUserId,
+        request: signal ? { signal } : undefined,
       });
       return response.data.login;
     } catch (error) {
@@ -154,12 +189,13 @@ export class GitHubClient implements GitHubAccessProvider {
     }
   }
 
-  async resolveInstallation(): Promise<GitHubInstallation> {
+  async resolveInstallation(signal?: AbortSignal): Promise<GitHubInstallation> {
     try {
       const response = await this.app.octokit.request(
         "GET /orgs/{org}/installation",
         {
           org: this.org,
+          request: signal ? { signal } : undefined,
         },
       );
       const data = response.data;
@@ -244,7 +280,8 @@ export class GitHubClient implements GitHubAccessProvider {
         orgId: this.orgId || 0,
         githubUserId,
         githubLogin: login,
-        role: (response.data.role === "admin" ? "admin" : "member") as "admin" | "member",
+        role: (response.data.role === "admin" ? "admin" : "member") as
+          "admin" | "member",
         state: response.data.state,
       };
     } catch (error) {
@@ -256,41 +293,49 @@ export class GitHubClient implements GitHubAccessProvider {
     teamId: number,
     githubUserId: number,
   ): Promise<TeamMembership | null> {
-    try {
-      const client = await this.getInstallationClient();
-      const login = await this.getLoginByUserId(githubUserId, client);
-
+    // Bound the whole call (login lookup + membership read) by a deadline well
+    // under the revoke lease; see GITHUB_REQUEST_TIMEOUT_MS.
+    return withRequestTimeout(async (signal) => {
       try {
-        if (!this.orgId) {
-          const inst = await this.resolveInstallation();
-          this.orgId = inst.targetId;
-        }
+        const client = await this.getInstallationClient(signal);
+        const login = await this.getLoginByUserId(githubUserId, client, signal);
 
-        const response = await client.request(
-          "GET /organizations/{org_id}/team/{team_id}/memberships/{username}",
-          {
-            org_id: this.orgId,
-            team_id: teamId,
-            username: login,
-          },
-        );
+        try {
+          if (!this.orgId) {
+            const inst = await this.resolveInstallation(signal);
+            this.orgId = inst.targetId;
+          }
 
-        return {
-          teamId,
-          githubUserId,
-          githubLogin: login,
-          role: response.data.state === "pending" ? "pending" : response.data.role,
-        };
-      } catch (innerError) {
-        const status = (innerError as { status?: number }).status;
-        if (status === 404) {
-          return null; // Not a member
+          const response = await client.request(
+            "GET /organizations/{org_id}/team/{team_id}/memberships/{username}",
+            {
+              org_id: this.orgId,
+              team_id: teamId,
+              username: login,
+              request: { signal },
+            },
+          );
+
+          return {
+            teamId,
+            githubUserId,
+            githubLogin: login,
+            role:
+              response.data.state === "pending"
+                ? "pending"
+                : response.data.role,
+          };
+        } catch (innerError) {
+          const status = (innerError as { status?: number }).status;
+          if (status === 404) {
+            return null; // Not a member
+          }
+          throw innerError;
         }
-        throw innerError;
+      } catch (error) {
+        this.handleError(error);
       }
-    } catch (error) {
-      this.handleError(error);
-    }
+    });
   }
 
   async addTeamMember(
@@ -328,31 +373,40 @@ export class GitHubClient implements GitHubAccessProvider {
   }
 
   async removeTeamMember(teamId: number, githubUserId: number): Promise<void> {
-    try {
-      const client = await this.getInstallationClient();
-      const login = await this.getLoginByUserId(githubUserId, client);
+    // Bound the destructive call by a deadline well under the revoke lease; see
+    // GITHUB_REQUEST_TIMEOUT_MS. On timeout the request is aborted and surfaces
+    // as a transient error, so it retries instead of hanging past the lease.
+    return withRequestTimeout(async (signal) => {
+      try {
+        const client = await this.getInstallationClient(signal);
+        const login = await this.getLoginByUserId(githubUserId, client, signal);
 
-      if (!this.orgId) {
-        const inst = await this.resolveInstallation();
-        this.orgId = inst.targetId;
-      }
+        if (!this.orgId) {
+          const inst = await this.resolveInstallation(signal);
+          this.orgId = inst.targetId;
+        }
 
-      await client.request(
-        "DELETE /organizations/{org_id}/team/{team_id}/memberships/{username}",
-        {
-          org_id: this.orgId,
-          team_id: teamId,
-          username: login,
-        },
-      );
-    } catch (error) {
-      const err = error as { status?: number; response?: { status?: number } };
-      const status = err.status || err.response?.status;
-      if (status === 404) {
-        return; // Idempotent delete
+        await client.request(
+          "DELETE /organizations/{org_id}/team/{team_id}/memberships/{username}",
+          {
+            org_id: this.orgId,
+            team_id: teamId,
+            username: login,
+            request: { signal },
+          },
+        );
+      } catch (error) {
+        const err = error as {
+          status?: number;
+          response?: { status?: number };
+        };
+        const status = err.status || err.response?.status;
+        if (status === 404) {
+          return; // Idempotent delete
+        }
+        this.handleError(error);
       }
-      this.handleError(error);
-    }
+    });
   }
 
   async getAuthenticatedUser(userAccessToken: string): Promise<GitHubUser> {
