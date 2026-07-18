@@ -20,6 +20,7 @@ All input fields originating from untrusted sources (Slack UI, GitHub Webhooks, 
 
 - **Timing Attack Mitigation**: When validating Webhook signatures, a constant-time comparison helper (`crypto.timingSafeEqual`) is used to compare calculated digests against received headers.
 - **Anti-CSRF (State Parameter)**: OAuth state parameters are cryptographically signed with HMAC-SHA256 using `APP_SECRET` and contain short-lived random nonces.
+- **Browser Identity Binding (Sign in with Slack)**: GitHub account linking first requires the browser to complete "Sign in with Slack" (OpenID Connect). The Slack callback verifies that the OIDC-authenticated `team_id`/`user_id` match the Slack identity recorded in the signed state, then issues a one-time `HttpOnly`/`SameSite=Lax` browser-binding cookie. The GitHub callback links accounts only if that cookie hashes to the value stored for the flow, preventing a forwarded connect link from binding a victim's GitHub account to the attacker's Slack user. The OIDC `id_token` is trusted per OpenID Connect Core §3.1.3.7 (received directly over the server-to-server TLS token exchange) with `iss`/`aud`/`exp`/`nonce` validated.
 - **Secure Random Generation**: Cryptographic nonces and tokens (such as download links) are generated using securely-seeded pseudo-random generators (`crypto.randomBytes`).
 
 ---

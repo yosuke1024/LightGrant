@@ -32,7 +32,8 @@ Before submiting access requests for the first time, users must link their Slack
    > 🔗 *GitHub Account Link Required*
    > To use LightGrant, you need to authorize and link your GitHub account. Please click the link below to get started.
    > [Authorize GitHub Identity](https://your-domain.com/auth/github/start?...)
-3. Click the link, click authorize on GitHub, and you will see a success page confirming your accounts are linked. Future requests will proceed directly.
+3. Click the link. You will first be asked to **Sign in with Slack** to confirm you are the same Slack user that started the request, then to **authorize on GitHub**. After both steps you will see a success page confirming your accounts are linked. Future requests will proceed directly.
+   > **Note**: Complete both steps in the same browser. If you open the link as a different Slack user, or forward the GitHub authorization page to someone else, verification will fail by design — this protects against linking your GitHub account to the wrong Slack user.
 
 ### How to Request Temporary Access
 1. Type `/lightgrant` in any Slack channel and submit.
