@@ -19,8 +19,8 @@ export interface SlackOidcIdentity {
   teamId: string;
   /** Slack user id (the `https://slack.com/user_id` claim). */
   userId: string;
-  /** The `nonce` claim echoed back from the authorize request, if present. */
-  nonce: string | null;
+  /** The `nonce` claim echoed back from the authorize request (required). */
+  nonce: string;
 }
 
 /**
@@ -50,12 +50,13 @@ export function buildSlackAuthorizeUrl(params: {
 /**
  * Decode and validate a Slack OIDC id_token.
  *
- * The id_token is received directly from Slack's token endpoint over a
- * server-to-server TLS channel authenticated with our client secret, so per
- * OpenID Connect Core §3.1.3.7 (6) the JWT signature MAY be trusted without a
- * JWKS round-trip. We still validate the security-relevant claims (iss, aud,
- * exp) so a token minted for a different audience or an expired one is
- * rejected.
+ * A real Slack ID Token is an RS256-signed JWT. It is received directly from
+ * Slack's token endpoint over a server-to-server TLS channel authenticated with
+ * our client secret, so per OpenID Connect Core §3.1.3.7 (6) authenticity is
+ * established by TLS server validation and the JWT signature MAY be trusted
+ * without an additional JWKS round-trip (we do not verify the signature here).
+ * Every security-relevant claim is validated fail-closed: a missing, malformed,
+ * expired, wrong-issuer, wrong-audience, or nonce-less token is rejected.
  */
 function decodeAndValidateIdToken(
   idToken: string,
@@ -72,24 +73,41 @@ function decodeAndValidateIdToken(
       Buffer.from(parts[1], "base64url").toString("utf8"),
     ) as Record<string, unknown>;
   } catch {
-    throw new Error("Unparseable Slack id_token payload");
+    throw new Error("Malformed Slack id_token payload");
   }
 
   if (claims.iss !== SLACK_ISSUER) {
     throw new Error(`Unexpected id_token issuer: ${String(claims.iss)}`);
   }
 
-  // `aud` may be a string or an array of strings per the JWT spec.
+  // `aud` may be a string or an array of strings per the JWT spec. A single
+  // audience must equal our client id. Multiple audiences are only trusted when
+  // the token also names our client in `azp` (authorized party), otherwise a
+  // token minted for another app that merely lists us cannot be relied on.
   const aud = claims.aud;
-  const audMatches = Array.isArray(aud)
-    ? aud.includes(clientId)
-    : aud === clientId;
-  if (!audMatches) {
+  let audOk = false;
+  if (typeof aud === "string") {
+    audOk = aud === clientId;
+  } else if (Array.isArray(aud)) {
+    const containsClient = aud.includes(clientId);
+    audOk =
+      aud.length === 1
+        ? containsClient
+        : containsClient && claims.azp === clientId;
+  }
+  if (!audOk) {
     throw new Error("id_token audience does not match Slack client id");
   }
 
-  if (typeof claims.exp === "number" && Date.now() >= claims.exp * 1000) {
+  if (typeof claims.exp !== "number") {
+    throw new Error("Slack id_token missing or non-numeric exp claim");
+  }
+  if (Date.now() >= claims.exp * 1000) {
     throw new Error("Slack id_token has expired");
+  }
+
+  if (typeof claims.nonce !== "string" || claims.nonce.length === 0) {
+    throw new Error("Slack id_token missing nonce claim");
   }
 
   const teamId = claims["https://slack.com/team_id"];
@@ -98,11 +116,7 @@ function decodeAndValidateIdToken(
     throw new Error("Slack id_token missing team_id / user_id claims");
   }
 
-  return {
-    teamId,
-    userId,
-    nonce: typeof claims.nonce === "string" ? claims.nonce : null,
-  };
+  return { teamId, userId, nonce: claims.nonce };
 }
 
 /**

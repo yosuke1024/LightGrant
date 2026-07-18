@@ -114,10 +114,27 @@ oauthRouter.get("/auth/github/start", async (req, res) => {
     return res.status(400).send("Bad Request: State token is not valid.");
   }
 
-  // Begin the Sign in with Slack leg. Store the hash of the OIDC nonce so the
-  // Slack callback can fence a replayed authorization code.
+  // Begin the Sign in with Slack leg (unstarted -> oidc_pending). The nonce
+  // hash is recorded with a compare-and-swap so a second start for the same
+  // state cannot overwrite the pending nonce (which would strand the browser
+  // already redirected to Slack with the first nonce).
   const oidcNonce = crypto.randomBytes(32).toString("hex");
-  oauthRepo.setOidcNonceHash(dbState.id, hashOidcValue(oidcNonce));
+  const started = oauthRepo.beginSlackOidc(
+    dbState.id,
+    hashOidcValue(oidcNonce),
+    new Date().toISOString(),
+  );
+  if (!started) {
+    logger.warn(
+      { nonceHash },
+      "OAuth start rejected: sign-in already in progress or state no longer startable",
+    );
+    return res
+      .status(409)
+      .send(
+        "Conflict: This sign-in is already in progress. Run /lightgrant again if you need a fresh link.",
+      );
+  }
 
   const authorizeUrl = buildSlackAuthorizeUrl({
     clientId: config.SLACK_CLIENT_ID,
@@ -179,29 +196,12 @@ oauthRouter.get("/auth/slack/callback", async (req: Request, res: Response) => {
   }
 
   try {
+    // exchangeSlackOidcCode validates the id_token claims fail-closed (iss, aud,
+    // exp, nonce presence, team/user) and throws otherwise.
     const identity = await exchangeSlackOidcCode(
       code,
       `${config.PUBLIC_BASE_URL}/auth/slack/callback`,
     );
-
-    // Fence a replayed Slack authorization code: the id_token nonce must match
-    // the nonce we minted for THIS flow at /auth/github/start.
-    if (
-      dbState.oidc_nonce_hash &&
-      (!identity.nonce ||
-        !secureTokenEquals(
-          hashOidcValue(identity.nonce),
-          dbState.oidc_nonce_hash,
-        ))
-    ) {
-      logger.warn(
-        { nonceHash, slackUser: dbState.slack_user_id },
-        "Slack OIDC nonce mismatch — possible code replay",
-      );
-      return res
-        .status(400)
-        .send(securityErrorPage("Your sign-in could not be verified."));
-    }
 
     // The crux: the signed-in Slack user must be the one this flow was started
     // for. If not, someone forwarded a connect URL meant for another account.
@@ -227,21 +227,28 @@ oauthRouter.get("/auth/slack/callback", async (req: Request, res: Response) => {
         );
     }
 
-    // Issue the one-time browser-binding token. markSlackVerified only mutates
-    // rows that are still unverified and unused, so re-driving this leg cannot
-    // mint a second cookie for the same flow.
+    // Atomically transition oidc_pending -> slack_verified. The presented
+    // id_token nonce is verified INSIDE the CAS (it must equal the stored
+    // oidc_nonce_hash), so a state that skipped /auth/github/start (nonce hash
+    // NULL), a stale/replayed nonce, or a concurrent second callback all fail
+    // closed here — no cookie is issued and no redirect happens.
     const bindingToken = crypto.randomBytes(32).toString("hex");
-    const verified = oauthRepo.markSlackVerified(
+    const now = new Date().toISOString();
+    const verified = oauthRepo.completeSlackVerification(
       dbState.id,
-      new Date().toISOString(),
+      hashOidcValue(identity.nonce),
       hashOidcValue(bindingToken),
+      now,
+      now,
     );
     if (!verified) {
       logger.warn(
-        { nonceHash },
-        "Slack OIDC leg already completed for this flow",
+        { nonceHash, slackUser: dbState.slack_user_id },
+        "Slack OIDC verification not applied: nonce mismatch, not started, already verified, or expired",
       );
-      return res.status(400).send("Bad Request: State already verified.");
+      return res
+        .status(400)
+        .send(securityErrorPage("Your sign-in could not be verified."));
     }
 
     res.setHeader(
@@ -311,16 +318,19 @@ oauthRouter.get(
     // Slack" for THIS flow may finish the link. This is what stops a victim who
     // opened a forwarded GitHub-authorize URL (they carry no binding cookie) and
     // a state that somehow skipped the Slack leg (slack_verified_at is null).
+    //
+    // The snapshot check below only classifies the failure for a friendly
+    // response; the authoritative one-time consumption is the CAS that follows.
     const presentedBinding = parseCookies(req.headers.cookie)[BINDING_COOKIE];
-    if (
-      dbState.slack_verified_at === null ||
-      dbState.binding_token_hash === null ||
-      !presentedBinding ||
-      !secureTokenEquals(
+    const bindingLooksValid =
+      dbState.slack_verified_at !== null &&
+      dbState.binding_token_hash !== null &&
+      Boolean(presentedBinding) &&
+      secureTokenEquals(
         hashOidcValue(presentedBinding),
         dbState.binding_token_hash,
-      )
-    ) {
+      );
+    if (!bindingLooksValid) {
       logger.warn(
         {
           nonceHash,
@@ -339,11 +349,27 @@ oauthRouter.get(
         );
     }
 
-    // Consume state immediately to prevent replay attacks. This also clears the
-    // binding token hash so the one-time cookie can never link twice.
+    // Atomically consume the verified state (slack_verified -> consumed),
+    // re-checking the binding hash inside the same UPDATE. Only the single
+    // caller that wins this CAS proceeds to the GitHub token exchange; a
+    // concurrent callback with the same cookie loses the race and is refused
+    // here WITHOUT calling GitHub, so linking, audit, and resume run at most
+    // once. `now` is used for both the consumed-at stamp and the expiry guard.
     const timestamp = new Date().toISOString();
-    oauthRepo.markAsUsed(dbState.id, timestamp);
+    const consumed = oauthRepo.consumeVerifiedState(
+      dbState.id,
+      hashOidcValue(presentedBinding),
+      timestamp,
+      timestamp,
+    );
     clearBindingCookie(res);
+    if (!consumed) {
+      logger.warn(
+        { nonceHash },
+        "OAuth callback lost the state-consumption race — refusing duplicate link",
+      );
+      return res.status(409).send("Conflict: State already consumed.");
+    }
 
     try {
       // Exchange authorization code for token

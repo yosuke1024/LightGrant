@@ -33,6 +33,7 @@ import { generateStateToken } from "../../src/security/signed-state.js";
 import { config } from "../../src/config.js";
 import { OAuthStateRepository } from "../../src/persistence/repositories/oauth-state-repository.js";
 import { IdentityRepository } from "../../src/persistence/repositories/identity-repository.js";
+import { hashOidcValue } from "../../src/security/slack-oidc.js";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -41,9 +42,12 @@ import { WebClient } from "@slack/web-api";
 import { FakeGitHubClient } from "../fakes/fake-github-client.js";
 
 /**
- * Build a Slack OIDC id_token. The browser-binding flow trusts the token
- * endpoint's TLS channel and only decodes the payload, so a well-formed
- * unsigned JWT with valid claims is sufficient for the fake.
+ * Build a Slack OIDC id_token for the fake token endpoint. A real Slack ID
+ * Token is an RS256-signed JWT; the app relies on the server-to-server TLS
+ * channel of the token exchange for authenticity (OpenID Connect Core
+ * §3.1.3.7) rather than verifying the signature itself, so it only decodes and
+ * validates the claims. This fake therefore carries a placeholder signature
+ * segment — the app never inspects it — but a fully valid claim set.
  */
 function buildSlackIdToken(opts: {
   teamId: string;
@@ -315,6 +319,169 @@ describe("GitHub OAuth Flow Integration", () => {
       `${baseUrl}/auth/github/callback?code=mock-code&state=${stateToken}`,
     );
     expect(res.status).toBe(403);
+  });
+
+  it("Slack callback fails closed when the state never started (no OIDC nonce)", async () => {
+    // A state that skipped /auth/github/start has oidc_nonce_hash = NULL. Even
+    // with a perfectly matching Slack identity, nonce verification must not be
+    // bypassed.
+    const stateToken = seedState("W123", "U456");
+    mockTokenEndpoints(() =>
+      buildSlackIdToken({ teamId: "W123", userId: "U456", nonce: "whatever" }),
+    );
+
+    const res = await fetch(
+      `${baseUrl}/auth/slack/callback?code=slack-code&state=${stateToken}`,
+      { redirect: "manual" },
+    );
+
+    expect(res.status).not.toBe(302);
+    expect(bindingCookie(res.headers.get("set-cookie"))).toBeFalsy();
+    const row = db
+      .prepare("SELECT slack_verified_at, binding_token_hash FROM oauth_states")
+      .get();
+    expect(row.slack_verified_at).toBeNull();
+    expect(row.binding_token_hash).toBeNull();
+  });
+
+  it("Slack callback rejects an id_token whose nonce does not match the flow", async () => {
+    const stateToken = seedState("W123", "U456");
+    // Complete /auth/github/start so a nonce is recorded for this flow.
+    await fetch(`${baseUrl}/auth/github/start?state=${stateToken}`, {
+      redirect: "manual",
+    });
+    // Return an id_token carrying a DIFFERENT (stale/attacker) nonce.
+    mockTokenEndpoints(() =>
+      buildSlackIdToken({
+        teamId: "W123",
+        userId: "U456",
+        nonce: "stale-nonce-not-ours",
+      }),
+    );
+
+    const res = await fetch(
+      `${baseUrl}/auth/slack/callback?code=slack-code&state=${stateToken}`,
+      { redirect: "manual" },
+    );
+
+    expect(res.status).not.toBe(302);
+    expect(bindingCookie(res.headers.get("set-cookie"))).toBeFalsy();
+    expect(
+      db.prepare("SELECT slack_verified_at FROM oauth_states").get()
+        .slack_verified_at,
+    ).toBeNull();
+  });
+
+  it("Slack callback rejects an id_token that is missing its nonce", async () => {
+    const stateToken = seedState("W123", "U456");
+    await fetch(`${baseUrl}/auth/github/start?state=${stateToken}`, {
+      redirect: "manual",
+    });
+    mockTokenEndpoints(() =>
+      buildSlackIdToken({ teamId: "W123", userId: "U456", nonce: null }),
+    );
+
+    const res = await fetch(
+      `${baseUrl}/auth/slack/callback?code=slack-code&state=${stateToken}`,
+      { redirect: "manual" },
+    );
+
+    expect(res.status).not.toBe(302);
+    expect(
+      db.prepare("SELECT slack_verified_at FROM oauth_states").get()
+        .slack_verified_at,
+    ).toBeNull();
+  });
+
+  it("running /auth/github/start twice does not overwrite the OIDC nonce", async () => {
+    const stateToken = seedState("W123", "U456");
+
+    const first = await fetch(
+      `${baseUrl}/auth/github/start?state=${stateToken}`,
+      { redirect: "manual" },
+    );
+    expect(first.status).toBe(302);
+    const firstNonce = new URL(first.headers.get("location")!).searchParams.get(
+      "nonce",
+    )!;
+
+    // A second start must not mint and store a new nonce over the pending one.
+    const second = await fetch(
+      `${baseUrl}/auth/github/start?state=${stateToken}`,
+      { redirect: "manual" },
+    );
+    expect(second.status).not.toBe(302);
+
+    const storedHash = db
+      .prepare("SELECT oidc_nonce_hash FROM oauth_states")
+      .get().oidc_nonce_hash;
+    expect(storedHash).toBe(hashOidcValue(firstNonce));
+  });
+
+  it("GitHub callback consumes a verified state at most once under concurrency", async () => {
+    const { stateToken, slackRes } = await driveFullFlow(
+      "W123",
+      "U456",
+      999,
+      "octocat",
+    );
+    const cookie = bindingCookie(slackRes.headers.get("set-cookie"))!;
+
+    // Barrier so the winning callback parks INSIDE the GitHub token exchange
+    // while the second callback runs. This forces genuine overlap rather than
+    // relying on accidental sequential execution.
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let githubTokenCalls = 0;
+    const originalFetch = global.fetch;
+    vi.spyOn(global, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : (input as any).url;
+      if (url.includes("github.com/login/oauth/access_token")) {
+        githubTokenCalls++;
+        await barrier;
+        return {
+          ok: true,
+          headers: new Headers({ "content-type": "application/json" }),
+          json: async () => ({ access_token: "mock-user-token" }),
+        } as any;
+      }
+      return originalFetch(input, init);
+    });
+    (global as any).__mockRequest.mockResolvedValue({
+      data: { id: 999, login: "octocat", name: "octocat", email: "o@x.com" },
+    });
+
+    const p1 = fetch(
+      `${baseUrl}/auth/github/callback?code=code-1&state=${stateToken}`,
+      { headers: { cookie: `lg_bind=${cookie}` } },
+    );
+    const p2 = fetch(
+      `${baseUrl}/auth/github/callback?code=code-2&state=${stateToken}`,
+      { headers: { cookie: `lg_bind=${cookie}` } },
+    );
+
+    // The loser is refused before any GitHub call, so it settles while the
+    // winner is still parked on the barrier. Wait for that first settlement
+    // (deterministic — no fixed sleep) before releasing the winner.
+    await Promise.race([p1, p2]);
+    release();
+
+    const [r1, r2] = await Promise.all([p1, p2]);
+    const statuses = [r1.status, r2.status];
+    expect(statuses.filter((s) => s === 200)).toHaveLength(1);
+    expect(statuses.some((s) => s === 400 || s === 409)).toBe(true);
+
+    // The GitHub token endpoint — and therefore the link/audit/resume work —
+    // must run at most once.
+    expect(githubTokenCalls).toBe(1);
+    const linkCount = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM identity_links WHERE slack_user_id = 'U456'",
+      )
+      .get().n;
+    expect(linkCount).toBe(1);
   });
 
   it("GET /auth/github/callback should handle OAuth link conflicts (Cases A-D)", async () => {

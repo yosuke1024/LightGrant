@@ -122,4 +122,86 @@ describe("slack-oidc", () => {
       /team_id/,
     );
   });
+
+  it("rejects an id_token whose exp claim is missing", async () => {
+    mockTokenResponse({
+      ok: true,
+      id_token: idToken(baseClaims({ exp: undefined })),
+    });
+    await expect(exchangeSlackOidcCode("code", "https://cb")).rejects.toThrow(
+      /exp/,
+    );
+  });
+
+  it("rejects an id_token whose exp claim is not a number", async () => {
+    mockTokenResponse({
+      ok: true,
+      id_token: idToken(baseClaims({ exp: "soon" })),
+    });
+    await expect(exchangeSlackOidcCode("code", "https://cb")).rejects.toThrow(
+      /exp/,
+    );
+  });
+
+  it("rejects an id_token whose nonce claim is missing", async () => {
+    mockTokenResponse({
+      ok: true,
+      id_token: idToken(baseClaims({ nonce: undefined })),
+    });
+    await expect(exchangeSlackOidcCode("code", "https://cb")).rejects.toThrow(
+      /nonce/,
+    );
+  });
+
+  it("rejects an id_token whose nonce claim is empty", async () => {
+    mockTokenResponse({
+      ok: true,
+      id_token: idToken(baseClaims({ nonce: "" })),
+    });
+    await expect(exchangeSlackOidcCode("code", "https://cb")).rejects.toThrow(
+      /nonce/,
+    );
+  });
+
+  it("rejects a malformed JWT that is not three segments", async () => {
+    mockTokenResponse({ ok: true, id_token: "not.a-jwt" });
+    await expect(exchangeSlackOidcCode("code", "https://cb")).rejects.toThrow(
+      /Malformed/,
+    );
+  });
+
+  it("accepts a single-element aud array", async () => {
+    mockTokenResponse({
+      ok: true,
+      id_token: idToken(baseClaims({ aud: [config.SLACK_CLIENT_ID] })),
+    });
+    const identity = await exchangeSlackOidcCode("code", "https://cb");
+    expect(identity.userId).toBe("U123");
+  });
+
+  it("rejects a multi-audience id_token without a matching azp", async () => {
+    mockTokenResponse({
+      ok: true,
+      id_token: idToken(
+        baseClaims({ aud: [config.SLACK_CLIENT_ID, "another-app"] }),
+      ),
+    });
+    await expect(exchangeSlackOidcCode("code", "https://cb")).rejects.toThrow(
+      /audience/,
+    );
+  });
+
+  it("accepts a multi-audience id_token when azp binds our client", async () => {
+    mockTokenResponse({
+      ok: true,
+      id_token: idToken(
+        baseClaims({
+          aud: [config.SLACK_CLIENT_ID, "another-app"],
+          azp: config.SLACK_CLIENT_ID,
+        }),
+      ),
+    });
+    const identity = await exchangeSlackOidcCode("code", "https://cb");
+    expect(identity.userId).toBe("U123");
+  });
 });
