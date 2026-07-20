@@ -387,16 +387,70 @@ export async function handleLightGrantCommand(
 }
 
 /**
+ * External selects backed by the GitHub team cache, keyed by action_id.
+ *
+ * markUnsupportedTeams controls the "(IdP managed — unsupported)" suffix. It is
+ * only meaningful where the chosen team becomes a grant target, because
+ * LightGrant cannot mutate membership of an IdP-synchronized team. Requester
+ * eligibility pickers merely read membership, so the suffix would be wrong
+ * there.
+ */
+const TEAM_OPTION_SELECTS: Record<string, { markUnsupportedTeams: boolean }> = {
+  team_select: { markUnsupportedTeams: true },
+  policy_target_team_select: { markUnsupportedTeams: true },
+  policy_requester_teams_select: { markUnsupportedTeams: false },
+};
+
+/**
+ * Routes a Slack external-select options request to its loader by action_id.
+ *
+ * Registered as the single options listener so that ack() is called exactly
+ * once. Dispatching on action_id here — rather than matching every `*_select`
+ * with one regex — keeps a newly added select from silently inheriting the team
+ * list.
+ */
+export async function handleOptionsLoad({
+  options,
+  ack,
+  db,
+}: {
+  options: { value?: string; action_id?: string };
+  ack: unknown;
+  db: Database.Database;
+}): Promise<void> {
+  const actionId = options.action_id || "";
+  const select = TEAM_OPTION_SELECTS[actionId];
+
+  if (!select) {
+    // Fail closed: an unrecognized select must not fall through to the team
+    // list. Acking an empty option set keeps Slack responsive while surfacing
+    // the missing registration in logs.
+    logger.warn({ actionId }, "No options loader registered for select");
+    await (ack as (response: unknown) => Promise<void>)({ options: [] });
+    return;
+  }
+
+  await handleTeamOptionsLoad({
+    options,
+    ack,
+    db,
+    markUnsupportedTeams: select.markUnsupportedTeams,
+  });
+}
+
+/**
  * Handles dynamic search options load for target GitHub teams in Slack.
  */
 export async function handleTeamOptionsLoad({
   options,
   ack,
   db,
+  markUnsupportedTeams = true,
 }: {
   options: { value?: string };
   ack: unknown;
   db: Database.Database;
+  markUnsupportedTeams?: boolean;
 }): Promise<void> {
   const typedAck = ack as (response: unknown) => Promise<void>;
   const query = options.value || "";
@@ -404,7 +458,7 @@ export async function handleTeamOptionsLoad({
   const matched = teamRepo.searchTeams(query, 100);
 
   const slackOptions = matched.map((team) => {
-    const isIdp = team.synchronized_flag === 1;
+    const isIdp = markUnsupportedTeams && team.synchronized_flag === 1;
     return {
       text: {
         type: "plain_text",

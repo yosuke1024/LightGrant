@@ -10,6 +10,7 @@ import {
 import Database from "better-sqlite3";
 import {
   handleTeamOptionsLoad,
+  handleOptionsLoad,
   handleRequestModalSubmission,
 } from "../../src/integrations/slack/commands.js";
 import { TeamRepository } from "../../src/persistence/repositories/team-repository.js";
@@ -95,6 +96,93 @@ describe("Slack Modal & Dynamic Select Handlers", () => {
     expect(ackArg.options).toHaveLength(1);
     expect(ackArg.options[0].text.text).toBe("frontend-team");
     expect(ackArg.options[0].value).toBe("101");
+  });
+
+  describe("handleOptionsLoad routing", () => {
+    const seedIdpTeam = (): void => {
+      const teamRepo = new TeamRepository(db);
+      teamRepo.upsertTeams(
+        1111,
+        [
+          {
+            id: 201,
+            name: "sso-team",
+            slug: "sso-team",
+            description: "",
+            privacy: "closed",
+          },
+        ],
+        new Date().toISOString(),
+      );
+      teamRepo.setSynchronizedFlag(201, true);
+    };
+
+    it("serves the team cache for the request modal target select", async () => {
+      seedIdpTeam();
+      const ack = vi.fn();
+
+      await handleOptionsLoad({
+        options: { value: "sso", action_id: "team_select" },
+        ack,
+        db,
+      });
+
+      const ackArg = ack.mock.calls[0][0];
+      expect(ackArg.options).toHaveLength(1);
+      expect(ackArg.options[0].value).toBe("201");
+    });
+
+    it("marks IdP-managed teams as unsupported for grant target selects", async () => {
+      seedIdpTeam();
+      const ack = vi.fn();
+
+      await handleOptionsLoad({
+        options: { value: "sso", action_id: "policy_target_team_select" },
+        ack,
+        db,
+      });
+
+      expect(ack.mock.calls[0][0].options[0].text.text).toBe(
+        "sso-team (IdP managed — unsupported)",
+      );
+    });
+
+    it("does not mark IdP-managed teams for requester eligibility selects", async () => {
+      // Requester eligibility only reads membership, so an IdP-synchronized
+      // team is perfectly usable here and must not be labelled unsupported.
+      seedIdpTeam();
+      const ack = vi.fn();
+
+      await handleOptionsLoad({
+        options: { value: "sso", action_id: "policy_requester_teams_select" },
+        ack,
+        db,
+      });
+
+      expect(ack.mock.calls[0][0].options[0].text.text).toBe("sso-team");
+    });
+
+    it("returns no options for an unregistered select instead of the team list", async () => {
+      seedIdpTeam();
+      const ack = vi.fn();
+
+      await handleOptionsLoad({
+        options: { value: "sso", action_id: "repository_select" },
+        ack,
+        db,
+      });
+
+      expect(ack.mock.calls[0][0].options).toEqual([]);
+    });
+
+    it("returns no options when action_id is absent", async () => {
+      seedIdpTeam();
+      const ack = vi.fn();
+
+      await handleOptionsLoad({ options: { value: "sso" }, ack, db });
+
+      expect(ack.mock.calls[0][0].options).toEqual([]);
+    });
   });
 
   it("handleRequestModalSubmission should save request and trigger notifier", async () => {
