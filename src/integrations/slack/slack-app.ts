@@ -3,7 +3,7 @@ const { App, ExpressReceiver } = pkg;
 import { config } from "../../config.js";
 import {
   handleLightGrantCommand,
-  handleTeamOptionsLoad,
+  handleOptionsLoad,
   handleRequestModalSubmission,
 } from "./commands.js";
 import {
@@ -59,9 +59,11 @@ export function initSlackApp(
     await handleLightGrantCommand({ command, ack, respond, client, db });
   });
 
-  // Dynamic Options (External Select for Target Teams)
-  app.options(/.*_select/, async ({ options, ack }) => {
-    await handleTeamOptionsLoad({ options, ack, db });
+  // Dynamic Options (External Selects)
+  // Single listener so ack() fires exactly once; routing happens by action_id
+  // inside handleOptionsLoad.
+  app.options(/.*/, async ({ options, ack }) => {
+    await handleOptionsLoad({ options, ack, db });
   });
 
   // Modal Submissions
